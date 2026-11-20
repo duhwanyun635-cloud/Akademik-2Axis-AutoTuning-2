@@ -1189,7 +1189,8 @@ def optimize_params(train_windows, valid_windows, current, fixed, n_trials=36, p
             "current_train": current_train, "current_valid": current_valid, "top": top_df, "all": all_df,
             "history": pd.DataFrame(history), "n_candidates": len(records), "usage": usage, "seed": seed,
             "objective": objective, "case_fixed": case_fixed, "kd_log": kd_log, "stable": stable,
-            "stability": stab_results.get(id(best_params)), "fixed": dict(fixed)}
+            "stability": stab_results.get(id(best_params)), "fixed": dict(fixed),
+            "stab_items": list(search_items[:STAB_WINDOWS])}
 
 
 def pareto_mask(x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -1745,7 +1746,7 @@ st.markdown("""
 """,unsafe_allow_html=True)
 st.title("선박 2축 안정화 시뮬레이터 (2)")
 st.caption("가상 파도 시험 + Akademik Tryoshnikov 전체 항해 기록 자동 재생 + 제어 파라미터 자동 최적화")
-st.caption("빌드 버전: FULL-DATA-AUTODOWNLOAD-V2-(2) · STAGE5-SEASTATE-TUNING · DL-FIX · SERVO2-KD · SERVO2-EXACT · STAB-SCAN · 2026-11-20")
+st.caption("빌드 버전: FULL-DATA-AUTODOWNLOAD-V2-(2) · STAGE5-SEASTATE-TUNING · DL-FIX · SERVO2-KD · SERVO2-EXACT · STAB-SCAN · STAB-SAME-WINDOWS · 2026-11-20")
 
 # Apply saved optimizer values before creating keyed widgets.
 if st.session_state.get("apply_best_on_next_run"):
@@ -2276,7 +2277,7 @@ if actual_mode:
         if st.button("현재 슬라이더 값 안정성 검사",key="run_stab_current"):
             try:
                 pk=get_pack(); tr,_=split_items(pk)
-                st.session_state["stab_current"]={"params":dict(current),"res":stability_check(current,tr[:STAB_WINDOWS],fixed)}
+                st.session_state["stab_current"]={"params":dict(current),"res":stability_check(current,(result.get("stab_items") if result and result.get("stab_items") else tr[:STAB_WINDOWS]),fixed)}
             except Exception as exc:
                 st.error(f"안정성 검사 오류: {type(exc).__name__}: {exc}")
         sc_=st.session_state.get("stab_current")
@@ -2504,7 +2505,8 @@ if actual_mode:
                     cands=[dict(base,kd=kv) for kv in kds]
                     v_in,v_sd,v_ow=prepare_inputs(va,VALID_NOISE_SEEDS)
                     ev=evaluate(v_in,v_sd,cands,fixed,OBJ_WEIGHTED,v_ow,progress_cb=lambda f: bar.progress(0.3+0.4*f,text="검증창 평가 중"))["summary"]
-                    k_in,k_sd,k_ow=prepare_inputs(tr[:STAB_WINDOWS])
+                    _ro=st.session_state.get("optimization_result")
+                    k_in,k_sd,k_ow=prepare_inputs(_ro.get("stab_items") if _ro and _ro.get("stab_items") else tr[:STAB_WINDOWS])
                     chk=stability_check_many(cands,k_in,k_sd,k_ow,fixed,lambda f: bar.progress(0.7+0.3*f,text="안정성 검사 중"))
                     val_tab=pd.DataFrame([{"Kd":kv,"자세 RMS비":e["rms_ratio"],"Roll RMS(°)":e["roll_rms"],"Pitch RMS(°)":e["pitch_rms"],
                                            "Roll 최대각(°)":e["roll_max"],"Pitch 최대각(°)":e["pitch_max"],
