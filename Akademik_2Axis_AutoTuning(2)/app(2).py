@@ -6,14 +6,18 @@ Modes
 - Actual ACE voyage: automatically downloads the complete public daily INS archive and the
   reconstructed sea-state CSV from Zenodo, indexes all daily files, then replays every continuous
   segment in chronological order without asking the user to upload files one by one.
-- Auto tuning: searches FF, Kp, Kd and complementary-filter alpha using representative windows
-  sampled across all available daily INS files. Servo parameters and assumed sensor-error settings
-  are held fixed during tuning.
+- Auto tuning (simulation-based random search + local search, stages 0-5: seeds and convergence,
+  all candidates and Pareto front, stability_check and constrained objective, Kp x Kd grid,
+  WMO sea-state binned tuning with transfer/regret matrices): searches FF, Kp, Kd and
+  complementary-filter alpha using representative windows sampled across the daily INS files.
+  Since stage 0 the tuner evaluates candidates with the SAME 50 Hz loop, the same linear
+  interpolation and the same noise sequence as live playback (see simulate_batch and
+  consistency_check). Servo parameters and assumed sensor-error settings are held fixed.
 
 Important limitations
 - ACE INS is uncorrected / not quality checked by the provider and was not synchronized with other
   onboard instrumentation as far as known.
-- ACE INS is 1 Hz. Playback interpolates between samples to run the educational 50 Hz model;
+- ACE INS is 1 Hz. Playback and tuning both interpolate between samples to run the 50 Hz model;
   interpolation does not recover unrecorded high-frequency ship motion.
 - ACE Hs/Tp is reconstructed from five-minute ship-heave spectra using a ship-specific RAO; it is
   not a direct buoy measurement at every instant.
@@ -37,6 +41,7 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 # -----------------------------------------------------------------------------
@@ -241,8 +246,15 @@ def read_wave_csv(path_or_file) -> pd.DataFrame:
     return out
 
 
+def epoch_seconds(series: pd.Series) -> np.ndarray:
+    """UTC 시각 → epoch 초. pandas 버전·시간 해상도(ns/us)에 상관없이 같은 값을 준다.
+    (astype("int64")/1e9는 pandas 3의 마이크로초 해상도에서 1000배 틀어진다.)"""
+    base = pd.Timestamp("1970-01-01", tz="UTC")
+    return ((series - base) / pd.Timedelta(seconds=1)).to_numpy(dtype=float)
+
+
 def split_continuous(df: pd.DataFrame):
-    ts = df["timestamp"].astype("int64").to_numpy() / 1e9
+    ts = epoch_seconds(df["timestamp"])
     dt = np.diff(ts)
     pos = dt[dt > 0]
     med = float(np.median(pos)) if len(pos) else 1.0
@@ -329,7 +341,10 @@ def nearest_wave(timestamp, wave_df: pd.DataFrame | None, tolerance_s=180.0):
         target = target.tz_localize("UTC")
     else:
         target = target.tz_convert("UTC")
-    sec = wave_df["timestamp"].astype("int64").to_numpy() / 1e9
+    sec = wave_df.attrs.get("_epoch")
+    if sec is None or len(sec) != len(wave_df):
+        sec = epoch_seconds(wave_df["timestamp"])
+        wave_df.attrs["_epoch"] = sec
     delta = np.abs(sec - target.timestamp())
     i = int(np.argmin(delta))
     if float(delta[i]) > tolerance_s:
@@ -343,15 +358,27 @@ def nearest_wave(timestamp, wave_df: pd.DataFrame | None, tolerance_s=180.0):
 # -----------------------------------------------------------------------------
 # Motion and control models
 # -----------------------------------------------------------------------------
-def classify_sea_state(hs: float) -> tuple[int, str]:
-    if not np.isfinite(hs): return 0, "자료 없음"
-    if hs <= 0.1: return 1, "고요"
-    if hs <= 0.5: return 2, "평온"
-    if hs <= 1.25: return 3, "약간 거침"
-    if hs <= 2.5: return 4, "보통"
-    if hs <= 4.0: return 5, "거침"
-    if hs <= 6.0: return 6, "매우 거침"
-    return 7, "높음 이상"
+WMO_CODES = [  # (코드, Hs 하한, Hs 상한, 이름) — WMO Sea State Code(Douglas 척도)
+    (0, 0.0, 0.0, "고요(유리면)"), (1, 0.0, 0.1, "고요(잔물결)"), (2, 0.1, 0.5, "평온"), (3, 0.5, 1.25, "약간 거침"),
+    (4, 1.25, 2.5, "보통"), (5, 2.5, 4.0, "거침"), (6, 4.0, 6.0, "매우 거침"), (7, 6.0, 9.0, "높음"),
+    (8, 9.0, 14.0, "매우 높음"), (9, 14.0, math.inf, "극심"),
+]
+
+
+def classify_sea_state(hs) -> tuple[int | None, str]:
+    """유의파고 Hs(m) → WMO 해상상태 코드 0~9. 자료가 없으면 (None, "자료 없음")."""
+    try:
+        hs = float(hs)
+    except (TypeError, ValueError):
+        return None, "자료 없음"
+    if not np.isfinite(hs) or hs < 0:
+        return None, "자료 없음"
+    if hs == 0:
+        return 0, WMO_CODES[0][3]
+    for code, lo, hi, name in WMO_CODES[1:]:
+        if hs <= hi:
+            return code, name
+    return 9, WMO_CODES[-1][3]
 
 
 def wave_components(tp: float, hs: float, count: int, seed: int = 123):
@@ -474,22 +501,103 @@ def control_step(state, motion, p, controller_on=True, accel_disturb=0.0, dt=CON
 
 
 # -----------------------------------------------------------------------------
-# Auto tuning: 1 Hz sampled INS windows from every day, servo hardware fixed
+# Auto tuning: simulation-based random search + local search, evaluated with the live 50 Hz loop
 # -----------------------------------------------------------------------------
-TUNE_BOUNDS = {"ff": (0.0, 1.2), "kp": (0.0, 4.0), "kd": (0.0, 0.30), "alpha": (0.90, 0.999)}
+TUNE_KEYS = ["ff", "kp", "kd", "alpha"]
+# Kd 상한: 4단계 Kp×Kd 격자에서 확인한 안정 경계(기본 서보 τ=0.10s에서 Kd≈0.07부터 진동) 바로 위까지만 탐색한다.
+# 그 이상은 기본 조건에서도 리밋사이클이므로 탐색할 이유가 없다. 경계 근처는 로그 스케일 샘플링으로 촘촘히 본다.
+KD_MAX = 0.12
+TUNE_BOUNDS = {"ff": (0.0, 1.2), "kp": (0.0, 4.0), "kd": (0.0, KD_MAX), "alpha": (0.90, 0.999)}
+KD_LOG_MIN = 0.002
+CASES = {
+    "① FF·Kp·Kd·α 전부 튜닝": {},
+    "② FF=1 고정, PD+α만 튜닝": {"ff": 1.0},
+    "③ FF=0 (PD만 사용), PD+α만 튜닝": {"ff": 0.0},
+}
+OBJ_WEIGHTED = "가중합 방식 (기존 방식, effort 재정의)"
+OBJ_CONSTRAINED = "제약 조건 방식 (포화율 ≤1%, 리밋사이클 없음)"
+OBJECTIVES = [OBJ_CONSTRAINED, OBJ_WEIGHTED]
+
+SEARCH_WINDOWS = 30            # 탐색 단계에서 쓰는 학습창 수(무작위 추출, 시드 고정)
+SUBSET_SEED = 20261120         # 탐색용 학습창 추출 시드(+ 탐색 시드)
+NOISE_SEED_BASE = 2026         # 창 i의 기본 센서 노이즈 시드 = NOISE_SEED_BASE + i
+VALID_NOISE_SEEDS = 3          # 검증 평가에 쓰는 노이즈 시드 수(창마다)
+SEED_STRIDE = 7919             # 같은 창의 r번째 노이즈 시드 = 기본 시드 + SEED_STRIDE*r
+CONSISTENCY_TOL = 0.05         # 실시간 재생과 튜닝 평가의 허용 차이(5%)
+SERIES_BUDGET = 16_000_000     # p95 계산용 시계열 저장 상한(원소 수, 약 64 MB)
+
+# 리밋사이클·고주파 명령 판정 (임계값은 기본 조건의 안정/진동 사례로 보정)
+HF_CUTOFF_HZ = 2.0             # 이 주파수 이상을 고주파 명령으로 본다
+LC_HF_RATIO = 0.30             # 관절각 분산 중 2Hz 이상 성분 비율이 이 값을 넘고
+LC_HF_RMS = 0.30               # 2Hz 이상 성분 RMS가 이 값(°)을 넘으면 리밋사이클
+LC_FLIP_HZ = 3.0               # 또는 관절 각속도 부호 변화로 본 진동 주파수가 이 값(Hz)을 넘으면 리밋사이클
+FLIP_DEADBAND = 5.0            # 부호 변화 계산에서 무시할 작은 각속도(°/s, 노이즈 떨림 제외)
+SAT_CONSTRAINT = 0.01          # 제약 조건 방식: 포화율 상한
+PENALTY = 5.0                  # 제약 위반 페널티
+STAB_GAIN_FACTORS = (1.5, 2.0)
+STAB_TAU_FACTORS = (0.5, 1.5)
+STAB_SAT_MAX = 0.05
+STAB_TOP_K = 6                 # 안정성 검사를 할 상위 후보 수
+STAB_WINDOWS = 8               # 안정성 검사에 쓰는 창 수
 
 
-def make_tuning_windows(archive_path: Path, manifest: list[dict], max_per_day=2, window_rows=240,
-                        max_total_windows=180):
-    """Sample representative 4-minute windows across dates; read each daily file once."""
-    windows = []
+def prior_tilt_rms(seg: pd.DataFrame, start_idx: int) -> dict:
+    """창 시작 직전 L분(2~5분) 동안의 선박 기울기 RMS(√(roll²+pitch²)). 하부 IMU가 측정할 수 있는 지표에 해당."""
+    el = seg["elapsed_s"].to_numpy(dtype=float)
+    r = seg["ship_roll"].to_numpy(dtype=float); p = seg["ship_pitch"].to_numpy(dtype=float)
+    t0 = el[start_idx]
+    out = {}
+    for L in (2, 3, 4, 5):
+        m = (el >= t0 - 60*L) & (el < t0)
+        out[L] = float(np.sqrt(np.mean(r[m]**2 + p[m]**2))) if m.sum() >= 30*L else np.nan
+    return out
+
+
+def label_window(it: dict, wave_df: pd.DataFrame | None) -> None:
+    """5-2: 창 시작·중앙·끝 시각의 Hs/Tp를 nearest_wave로 붙이고 WMO 코드를 정한다."""
+    df = it["df"]
+    ts = df["timestamp"]
+    picks = [ts.iloc[0], ts.iloc[len(ts)//2], ts.iloc[-1]]
+    found = [nearest_wave(x, wave_df) for x in picks]
+    ok = [f for f in found if f is not None and np.isfinite(f["Hs"])]
+    it["date"] = ts.iloc[0].strftime("%Y-%m-%d")
+    it["start_time"] = ts.iloc[0].strftime("%H:%M:%S")
+    it["roll_rms"] = float(np.sqrt(np.mean(df["ship_roll"].to_numpy(float)**2)))
+    it["pitch_rms"] = float(np.sqrt(np.mean(df["ship_pitch"].to_numpy(float)**2)))
+    it["wave_ok"] = bool(found[1] is not None and len(ok) >= 2)
+    if it["wave_ok"]:
+        hs = np.array([f["Hs"] for f in ok]); tp = np.array([f["Tp"] for f in ok], dtype=float)
+        it["Hs"] = float(np.mean(hs)); it["Tp"] = float(np.nanmean(tp)) if np.isfinite(tp).any() else np.nan
+        it["delta_max"] = float(max(f["delta_s"] for f in ok))
+        codes = {classify_sea_state(h)[0] for h in hs}
+        it["wmo"], it["wmo_name"] = classify_sea_state(it["Hs"])
+        it["boundary"] = len(codes) > 1
+    else:
+        it["Hs"] = np.nan; it["Tp"] = np.nan; it["delta_max"] = np.nan
+        it["wmo"], it["wmo_name"] = None, "파랑 자료 없음"; it["boundary"] = False
+
+
+def make_tuning_windows(archive_path: Path, manifest: list[dict], wave_df: pd.DataFrame | None = None,
+                        max_per_day=2, window_rows=240, max_total_windows=180) -> dict:
+    """대표 4분 창을 날짜 전체에서 균등하게 추출한다.
+    이전 버전은 앞 날짜부터 읽다가 max_total_windows에 도달하면 멈춰서 뒤쪽 날짜가 빠졌다.
+    이제는 사용할 날짜 수(max_total_windows/max_per_day)만큼 전체 기간에서 균등 간격으로 고른다."""
     unique_members = sorted(set(d["member"] for d in manifest), key=lambda name: Path(name).name)
     member_rank = {member: i for i, member in enumerate(unique_members)}
-
+    max_days = max(1, max_total_windows // max_per_day)
+    if len(unique_members) > max_days:
+        pick = sorted(set(np.linspace(0, len(unique_members)-1, max_days).round().astype(int)))
+        chosen = [unique_members[i] for i in pick]
+    else:
+        chosen = list(unique_members)
+    items = []
     with zipfile.ZipFile(archive_path, "r") as zf:
-        for member in unique_members:
-            with zf.open(member, "r") as f:
-                daily = read_ins_csv(f)
+        for member in chosen:
+            try:
+                with zf.open(member, "r") as f:
+                    daily = read_ins_csv(f)
+            except ValueError:
+                continue
             segments, _, _ = split_continuous(daily)
             candidates = []
             for seg in segments:
@@ -497,7 +605,6 @@ def make_tuning_windows(archive_path: Path, manifest: list[dict], max_per_day=2,
                 if n < 60:
                     continue
                 length = min(window_rows, n)
-                # Prefer start / middle / end coverage, but cap at max_per_day windows.
                 possible = sorted(set(int(x) for x in np.linspace(0, max(0, n - length), min(max_per_day, 3))))
                 for start_idx in possible:
                     window = seg.iloc[start_idx:start_idx + length].copy().reset_index(drop=True)
@@ -506,189 +613,815 @@ def make_tuning_windows(archive_path: Path, manifest: list[dict], max_per_day=2,
                     elapsed = window["elapsed_s"].to_numpy(dtype=float)
                     window["roll_rate"] = np.gradient(window["ship_roll"].to_numpy(dtype=float), elapsed)
                     window["pitch_rate"] = np.gradient(window["ship_pitch"].to_numpy(dtype=float), elapsed)
-                    candidates.append(window)
-            # Limit daily contribution so long files do not dominate the objective.
+                    candidates.append((window, prior_tilt_rms(seg, start_idx)))
             if len(candidates) > max_per_day:
-                pick = np.linspace(0, len(candidates) - 1, max_per_day).round().astype(int)
-                candidates = [candidates[i] for i in sorted(set(pick))]
+                sel = np.linspace(0, len(candidates) - 1, max_per_day).round().astype(int)
+                candidates = [candidates[i] for i in sorted(set(sel))]
             is_validation = (member_rank[member] % 5 == 0)
-            for window in candidates:
-                windows.append({"member": member, "validation": is_validation, "df": window})
-            if len(windows) >= max_total_windows:
-                break
-
-    if not windows:
-        raise ValueError("자동 최적화를 위한 1분 이상 연속 구간을 만들지 못했습니다.")
-
-    train = [w["df"] for w in windows if not w["validation"]]
-    valid = [w["df"] for w in windows if w["validation"]]
-    # Small archives: split at window level, keeping at least one validation window.
-    if len(train) < 2 or len(valid) < 1:
-        train = [w["df"] for i, w in enumerate(windows) if i % 5 != 0]
-        valid = [w["df"] for i, w in enumerate(windows) if i % 5 == 0]
-    if not valid:
-        valid = train[-max(1, len(train) // 5):]
-    if not train:
-        train = [w["df"] for w in windows]
-    processed_days = len(set(w["member"] for w in windows))
-    return train, valid, processed_days, len(windows)
+            for window, prior in candidates:
+                items.append({"df": window, "member": member, "validation": is_validation, "prior": prior})
+    if not items:
+        raise ValueError("자동 튜닝을 위한 1분 이상 연속 구간을 만들지 못했습니다.")
+    n_val = sum(it["validation"] for it in items)
+    if len(items) - n_val < 2 or n_val < 1:   # 작은 자료: 창 단위로 나눈다
+        for i, it in enumerate(items):
+            it["validation"] = (i % 5 == 0)
+    for gi, it in enumerate(items):
+        it["id"] = gi
+        it["seed"] = NOISE_SEED_BASE + gi
+        label_window(it, wave_df)
+    return {"items": items, "days_used": len(set(it["member"] for it in items)), "days_chosen": len(chosen),
+            "days_total": len(unique_members), "n_windows": len(items)}
 
 
-def simulate_tuning_window(df: pd.DataFrame, p: dict, fixed: dict, seed=2026):
-    """Run model on 1 Hz source points. No synthetic 50 Hz information is invented for tuning."""
+def window_inputs(df: pd.DataFrame) -> dict:
+    """튜닝 창을 실시간 재생과 똑같은 50 Hz 입력으로 만든다.
+    - 시간축: live_panel처럼 t=0에서 시작해 CONTROL_DT를 계속 더하고, t < 구간 길이일 때만 스텝을 진행한다.
+    - 보간: actual_motion_at과 같은 np.interp(선형 보간)를 roll, pitch, roll_rate, pitch_rate에 적용한다."""
+    x = df["elapsed_s"].to_numpy(dtype=float)
+    x = x - x[0]
     roll = df["ship_roll"].to_numpy(dtype=float)
     pitch = df["ship_pitch"].to_numpy(dtype=float)
-    rr = df["roll_rate"].to_numpy(dtype=float)
-    pr = df["pitch_rate"].to_numpy(dtype=float)
-    t = df["elapsed_s"].to_numpy(dtype=float)
-    n = len(t)
-    if n < 5: return None
-    dts = np.diff(t, prepend=t[0])
-    positive = dts[dts > 0]
-    default_dt = float(np.median(positive)) if len(positive) else 1.0
-    dts[0] = default_dt
-    dts = np.clip(dts, 0.2, 3.0)
+    rr = df["roll_rate"].to_numpy(dtype=float) if "roll_rate" in df else np.gradient(roll, x)
+    pr = df["pitch_rate"].to_numpy(dtype=float) if "pitch_rate" in df else np.gradient(pitch, x)
+    duration = float(x[-1])
+    ts = []
+    t = 0.0
+    while t < duration:
+        ts.append(t)
+        t += CONTROL_DT
+    t = np.asarray(ts if ts else [0.0], dtype=float)
+
+    def interp(v):
+        good = np.isfinite(v)
+        return np.interp(t, x[good], v[good]) if good.sum() >= 2 else np.full_like(t, np.nan)
+    return {"t": t, "ship": np.stack([interp(roll), interp(pitch)]), "rate": np.stack([interp(rr), interp(pr)]),
+            "init": (float(roll[0]), float(pitch[0])), "duration": duration}
+
+
+def noise_for(seed: int, n: int):
+    """new_sim_state(seed)와 control_step이 뽑는 난수를 같은 순서로 미리 만든다.
+    bias[축][하부, 상판], z[스텝][축][gyro_b, acc_b, gyro_p, acc_p]"""
     rng = np.random.default_rng(seed)
-    # Constant sensor bias per virtual IMU; random measurement noise at each recorded sample.
-    b_roll, bp_roll = rng.normal(0, 1, 2)
-    b_pitch, bp_pitch = rng.normal(0, 1, 2)
-    gb_r = rng.normal(0, fixed["gyro_noise"], n)
-    gb_p = rng.normal(0, fixed["gyro_noise"], n)
-    gp_r = rng.normal(0, fixed["gyro_noise"], n)
-    gp_p = rng.normal(0, fixed["gyro_noise"], n)
-    ab_r = rng.normal(0, fixed["acc_noise"], n)
-    ab_p = rng.normal(0, fixed["acc_noise"], n)
-    ap_r = rng.normal(0, fixed["acc_noise"], n)
-    ap_p = rng.normal(0, fixed["acc_noise"], n)
-
-    base_est_r, base_est_p = roll[0], pitch[0]
-    plate_est_r, plate_est_p = roll[0], pitch[0]
-    joint_r = joint_p = rate_r = rate_p = 0.0
-    out_r = np.empty(n); out_p = np.empty(n)
-    out_jr = np.empty(n); out_jp = np.empty(n)
-    out_rdot = np.empty(n); out_pdot = np.empty(n)
-    sat_count = 0
-    for i in range(n):
-        dt = float(dts[i])
-        # alpha is specified per 20 ms controller tick; convert its equivalent weight to source dt.
-        alpha_dt = float(p["alpha"] ** (dt / CONTROL_DT))
-        ship_r, ship_p = roll[i], pitch[i]
-        gyro_base_r = rr[i] + fixed["gyro_bias"]*b_roll + gb_r[i]
-        gyro_base_p = pr[i] + fixed["gyro_bias"]*b_pitch + gb_p[i]
-        t_rel = float(t[i] - t[0])
-        disturb_r = fixed.get("accel_disturb", 0.0) * math.sin(2*math.pi*0.23*t_rel)
-        disturb_p = fixed.get("accel_disturb", 0.0) * math.sin(2*math.pi*0.19*t_rel+0.7)
-        acc_base_r = ship_r + disturb_r + ab_r[i]
-        acc_base_p = ship_p + disturb_p + ab_p[i]
-        base_est_r = alpha_dt*(base_est_r + gyro_base_r*dt) + (1-alpha_dt)*acc_base_r
-        base_est_p = alpha_dt*(base_est_p + gyro_base_p*dt) + (1-alpha_dt)*acc_base_p
-
-        plate_before_r = ship_r + joint_r
-        plate_before_p = ship_p + joint_p
-        gyro_plate_r = rr[i] + rate_r + fixed["gyro_bias"]*bp_roll + gp_r[i]
-        gyro_plate_p = pr[i] + rate_p + fixed["gyro_bias"]*bp_pitch + gp_p[i]
-        plate_est_r = alpha_dt*(plate_est_r + gyro_plate_r*dt) + (1-alpha_dt)*(plate_before_r+disturb_r+ap_r[i])
-        plate_est_p = alpha_dt*(plate_est_p + gyro_plate_p*dt) + (1-alpha_dt)*(plate_before_p+disturb_p+ap_p[i])
-
-        cmd_r = -p["ff"]*base_est_r - p["kp"]*plate_est_r - p["kd"]*gyro_plate_r
-        cmd_p = -p["ff"]*base_est_p - p["kp"]*plate_est_p - p["kd"]*gyro_plate_p
-        cmd_r = float(np.clip(cmd_r, -fixed["limit"], fixed["limit"]))
-        cmd_p = float(np.clip(cmd_p, -fixed["limit"], fixed["limit"]))
-        # Exact first-order servo response over the source sample interval + rate/travel limits.
-        response = 1.0 - math.exp(-dt / max(fixed["tau"], 1e-4))
-        move_r = float(np.clip((cmd_r-joint_r)*response, -fixed["rate"]*dt, fixed["rate"]*dt))
-        move_p = float(np.clip((cmd_p-joint_p)*response, -fixed["rate"]*dt, fixed["rate"]*dt))
-        new_jr = float(np.clip(joint_r+move_r, -fixed["limit"], fixed["limit"]))
-        new_jp = float(np.clip(joint_p+move_p, -fixed["limit"], fixed["limit"]))
-        rate_r = (new_jr-joint_r)/dt
-        rate_p = (new_jp-joint_p)/dt
-        joint_r, joint_p = new_jr, new_jp
-        out_r[i] = ship_r + joint_r; out_p[i] = ship_p + joint_p
-        out_jr[i] = joint_r; out_jp[i] = joint_p
-        out_rdot[i] = rate_r; out_pdot[i] = rate_p
-        if abs(joint_r) >= fixed["limit"]*0.999 or abs(joint_p) >= fixed["limit"]*0.999:
-            sat_count += 1
-    rms_ship_r = max(float(np.sqrt(np.mean(roll**2))), 0.1)
-    rms_ship_p = max(float(np.sqrt(np.mean(pitch**2))), 0.1)
-    rms_out_r = float(np.sqrt(np.mean(out_r**2)))
-    rms_out_p = float(np.sqrt(np.mean(out_p**2)))
-    p95_ship_r = max(float(np.percentile(np.abs(roll), 95)), 0.1)
-    p95_ship_p = max(float(np.percentile(np.abs(pitch), 95)), 0.1)
-    p95_out_r = float(np.percentile(np.abs(out_r), 95))
-    p95_out_p = float(np.percentile(np.abs(out_p), 95))
-    max_ship_r = max(float(np.max(np.abs(roll))), 0.1)
-    max_ship_p = max(float(np.max(np.abs(pitch))), 0.1)
-    max_out_r = float(np.max(np.abs(out_r)))
-    max_out_p = float(np.max(np.abs(out_p)))
-    effort = float((np.sqrt(np.mean(out_jr**2)) + np.sqrt(np.mean(out_jp**2))) / (2*fixed["limit"]))
-    rate_usage = float((np.mean(np.abs(out_rdot)) + np.mean(np.abs(out_pdot))) / (2*fixed["rate"]))
-    saturation = sat_count / n
-    rms_ratio = 0.5*(rms_out_r/rms_ship_r + rms_out_p/rms_ship_p)
-    p95_ratio = 0.5*(p95_out_r/p95_ship_r + p95_out_p/p95_ship_p)
-    max_ratio = 0.5*(max_out_r/max_ship_r + max_out_p/max_ship_p)
-    # Lower is better: RMS, 95th-percentile and peak attitude error dominate; actuator use is penalized.
-    score = 0.45*rms_ratio + 0.20*p95_ratio + 0.15*max_ratio + 0.10*effort + 0.05*rate_usage + 0.05*saturation
-    return {"score": score, "roll_rms": rms_out_r, "pitch_rms": rms_out_p,
-            "roll_rms_before": rms_ship_r, "pitch_rms_before": rms_ship_p,
-            "roll_p95": p95_out_r, "pitch_p95": p95_out_p,
-            "roll_max": max_out_r, "pitch_max": max_out_p,
-            "effort": effort, "rate_usage": rate_usage, "saturation": saturation,
-            "roll_ratio": rms_out_r/rms_ship_r, "pitch_ratio": rms_out_p/rms_ship_p}
+    bias = np.array([rng.normal(0, 1) for _ in range(4)]).reshape(2, 2)
+    z = rng.normal(0.0, 1.0, size=(n, 2, 4))
+    return bias, z
 
 
-def evaluate_candidate(windows, p, fixed):
-    results = [simulate_tuning_window(w, p, fixed, seed=2026+i) for i, w in enumerate(windows)]
-    results = [r for r in results if r is not None]
-    if not results: return {"score": float("inf")}
-    # Average window scores so each window contributes equally, rather than longest files dominating.
-    keys = ["score", "roll_rms", "pitch_rms", "roll_rms_before", "pitch_rms_before",
-            "roll_p95", "pitch_p95", "roll_max", "pitch_max", "effort", "rate_usage", "saturation", "roll_ratio", "pitch_ratio"]
-    return {k: float(np.mean([r[k] for r in results])) for k in keys}
+def highpass_coeffs(fc: float, fs: float):
+    """2차 버터워스 고역통과 필터 계수(쌍선형 변환)."""
+    K = math.tan(math.pi * fc / fs)
+    q = 1 / math.sqrt(2)
+    norm = 1 / (1 + K/q + K*K)
+    return norm, -2*norm, norm, 2*(K*K - 1)*norm, (1 - K/q + K*K)*norm
 
 
-def optimize_params(train_windows, valid_windows, current, fixed, n_trials=36, progress_cb=None):
-    rng = np.random.default_rng(42)
-    candidates = [dict(current)]
+HP_COEF = highpass_coeffs(HF_CUTOFF_HZ, 1 / CONTROL_DT)
+
+
+def simulate_batch(inputs: list[dict], seeds: list[int], cands: list[dict], fixed: dict, progress_cb=None,
+                   keep_p95: bool = True) -> dict:
+    """여러 후보 × 여러 창을 한 번에 50 Hz로 시뮬레이션한다.
+    식은 control_step과 한 줄씩 같고, 노이즈 난수 순서도 같다(창마다 seeds[w]).
+    후보 dict에 "tau"가 있으면 그 후보만 서보 시간상수를 바꿔 계산한다(안정성 검사용).
+    반환: 지표 이름 -> (후보 C, 창 W) 배열"""
+    W, C = len(inputs), len(cands)
+    lens = np.array([inp["t"].size for inp in inputs])
+    N = int(lens.max())
+    ship = np.zeros((N, 2, W)); rate = np.zeros((N, 2, W)); tt = np.zeros((N, W)); valid = np.zeros((N, W), bool)
+    noise = np.zeros((N, 2, 4, W)); bias = np.zeros((2, 2, W)); init = np.zeros((2, W)); acc_err = np.zeros((N, 2, W))
+    for w, (inp, sd) in enumerate(zip(inputs, seeds)):
+        n = int(lens[w])
+        ship[:n, :, w] = inp["ship"].T; ship[n:, :, w] = inp["ship"][:, -1]
+        rate[:n, :, w] = inp["rate"].T
+        tt[:n, w] = inp["t"]; valid[:n, w] = True
+        if "acc" in inp:            # 가상 파도: 선박 가속도에 의한 가속도계 오염각
+            acc_err[:n, :, w] = inp["acc"].T
+        b, z = noise_for(int(sd), n)
+        bias[:, :, w] = b; noise[:n, :, :, w] = z
+        init[:, w] = inp["init"]
+    ad = float(fixed.get("accel_disturb", 0.0))
+    if ad > 0:  # control_step과 같은 가속도 오염 식
+        acc_err[:, 0] = acc_err[:, 0] + ad*np.sin(2*np.pi*0.23*tt)
+        acc_err[:, 1] = acc_err[:, 1] + ad*np.sin(2*np.pi*0.19*tt+0.7)
+
+    def col(k, default=None):
+        return np.array([c.get(k, default) for c in cands], dtype=float)[None, :, None]
+    ff, kp, kd, alpha = col("ff"), col("kp"), col("kd"), col("alpha")
+    tau = col("tau", float(fixed["tau"]))
+    dt = CONTROL_DT
+    rlim, limit = float(fixed["rate"]), float(fixed["limit"])
+    gn, gbias, an = float(fixed["gyro_noise"]), float(fixed["gyro_bias"]), float(fixed["acc_noise"])
+    b0, b1, b2, a1, a2 = HP_COEF
+    shape = (2, C, W)
+    base_est = np.broadcast_to(init[:, None, :], shape).copy()
+    plate_est = base_est.copy()
+    joint = np.zeros(shape); jrate = np.zeros(shape)
+    bb = bias[:, 0][:, None, :]; pb = bias[:, 1][:, None, :]
+    ss = np.zeros(shape); mx = np.zeros(shape); sat = np.zeros((C, W))
+    jsum = np.zeros(shape); jss = np.zeros(shape); jr_ss = np.zeros(shape); ja_ss = np.zeros(shape)
+    hx1 = np.zeros(shape); hx2 = np.zeros(shape); hy1 = np.zeros(shape); hy2 = np.zeros(shape); hp_ss = np.zeros(shape)
+    flips = np.zeros(shape); last_sgn = np.zeros(shape)
+    series = np.empty((N, 2, C, W), dtype=np.float32) if keep_p95 else None
+    for k in range(N):
+        sh = ship[k][:, None, :]; sr = rate[k][:, None, :]; ae = acc_err[k][:, None, :]; z = noise[k]
+        plate_before = sh + joint
+        plate_rate = sr + jrate
+        gyro_b = sr + gbias*bb + gn*z[:, 0][:, None, :]
+        acc_b = sh + ae + an*z[:, 1][:, None, :]
+        base_est = alpha*(base_est + gyro_b*dt) + (1-alpha)*acc_b
+        gyro_p = plate_rate + gbias*pb + gn*z[:, 2][:, None, :]
+        acc_p = plate_before + ae + an*z[:, 3][:, None, :]
+        plate_est = alpha*(plate_est + gyro_p*dt) + (1-alpha)*acc_p
+        cmd = np.clip(-ff*base_est - kp*plate_est - kd*gyro_p, -limit, limit)
+        d = np.clip((cmd - joint)*dt/tau, -rlim*dt, rlim*dt)
+        new_joint = np.clip(joint + d, -limit, limit)
+        new_rate = (new_joint - joint)/dt
+        jacc = (new_rate - jrate)/dt
+        jrate = new_rate
+        joint = new_joint
+        plate = sh + joint
+        m = valid[k][None, None, :]
+        ss += np.where(m, plate*plate, 0.0)
+        np.maximum(mx, np.where(m, np.abs(plate), 0.0), out=mx)
+        sat += ((np.abs(joint) >= limit*0.999).any(axis=0) & valid[k][None, :])
+        jsum += np.where(m, joint, 0.0); jss += np.where(m, joint*joint, 0.0)
+        jr_ss += np.where(m, jrate*jrate, 0.0); ja_ss += np.where(m, jacc*jacc, 0.0)
+        hy = b0*joint + b1*hx1 + b2*hx2 - a1*hy1 - a2*hy2
+        hx2 = hx1; hx1 = joint; hy2 = hy1; hy1 = hy
+        hp_ss += np.where(m, hy*hy, 0.0)
+        sgn = np.where(np.abs(jrate) > FLIP_DEADBAND, np.sign(jrate), 0.0)
+        flips += np.where(m & (sgn != 0) & (last_sgn != 0) & (sgn != last_sgn), 1.0, 0.0)
+        last_sgn = np.where(sgn != 0, sgn, last_sgn)
+        if keep_p95:
+            series[k] = np.abs(plate)
+        if progress_cb and k % 600 == 0:
+            progress_cb(k / N)
+    n = lens[None, None, :].astype(float)
+    if keep_p95:
+        p95 = np.empty(shape)
+        for w in range(W):
+            p95[:, :, w] = np.percentile(series[:lens[w], :, :, w], 95, axis=0)
+    else:
+        p95 = np.full(shape, np.nan)
+    ship_rms = np.stack([np.sqrt(np.mean(inp["ship"]**2, axis=1)) for inp in inputs], axis=1)   # (2, W)
+    ship_p95 = np.stack([np.percentile(np.abs(inp["ship"]), 95, axis=1) for inp in inputs], axis=1)
+    ship_max = np.stack([np.max(np.abs(inp["ship"]), axis=1) for inp in inputs], axis=1)
+    rms_out = np.sqrt(ss / n)
+    srms, sp95, smax = (np.maximum(v, 0.1)[:, None, :] for v in (ship_rms, ship_p95, ship_max))
+    roll_ratio, pitch_ratio = rms_out[0]/srms[0], rms_out[1]/srms[1]
+    rms_ratio = 0.5*(roll_ratio + pitch_ratio)
+    p95_ratio = 0.5*(p95[0]/sp95[0] + p95[1]/sp95[1])
+    max_ratio = 0.5*(mx[0]/smax[0] + mx[1]/smax[1])
+    # 3단계 effort 재정의: 필요한 관절 각도 자체가 아니라 '움직임의 격렬함'에 벌점을 준다.
+    rate_rms = np.sqrt(jr_ss / n).mean(axis=0) / rlim                       # 관절 각속도 RMS / 최대 각속도
+    acc_rms = np.sqrt(ja_ss / n).mean(axis=0) / (rlim / tau[0])             # 관절 각가속도 RMS / (최대 각속도/τ)
+    var = np.maximum(jss/n - (jsum/n)**2, 1e-12)
+    hf_axis = np.clip((hp_ss/n) / var, 0.0, 1.0)
+    hf_rms_axis = np.sqrt(hp_ss/n)
+    flip_axis = flips / (n*dt) / 2.0                                        # 부호 변화 2번 = 진동 1주기
+    hf = hf_axis.max(axis=0)
+    flip_hz = flip_axis.max(axis=0)
+    lc = (((hf_axis > LC_HF_RATIO) & (hf_rms_axis > LC_HF_RMS)) | (flip_axis > LC_FLIP_HZ)).any(axis=0).astype(float)
+    saturation = sat / n[0]
+    score_w = (0.45*rms_ratio + 0.20*p95_ratio + 0.15*max_ratio
+               + 0.05*rate_rms + 0.05*np.minimum(acc_rms, 1.0) + 0.05*hf + 0.05*saturation)
+    score_c = rms_ratio + PENALTY*(saturation > SAT_CONSTRAINT) + PENALTY*lc
+    rep_ = lambda v: np.broadcast_to(v[None, :], (C, W))
+    return {"score_w": score_w, "score_c": score_c, "rms_ratio": rms_ratio,
+            "roll_rms": rms_out[0], "pitch_rms": rms_out[1],
+            "roll_rms_before": rep_(srms[0, 0]), "pitch_rms_before": rep_(srms[1, 0]),
+            "roll_p95": p95[0], "pitch_p95": p95[1], "roll_max": mx[0], "pitch_max": mx[1],
+            "roll_ratio": roll_ratio, "pitch_ratio": pitch_ratio,
+            "rate_rms": rate_rms, "acc_rms": acc_rms, "hf": hf, "hf_rms": hf_rms_axis.max(axis=0), "flip_hz": flip_hz,
+            "lc": lc, "saturation": saturation, "steps": rep_(lens.astype(float))}
+
+
+METRIC_KEYS = ["score_w", "score_c", "rms_ratio", "roll_rms", "pitch_rms", "roll_rms_before", "pitch_rms_before",
+               "roll_p95", "pitch_p95", "roll_max", "pitch_max", "roll_ratio", "pitch_ratio", "rate_rms", "acc_rms",
+               "hf", "hf_rms", "flip_hz", "lc", "saturation"]
+
+
+def as_item(x):
+    return {"df": x} if isinstance(x, pd.DataFrame) else x
+
+
+def prepare_inputs(items: list, n_seeds: int = 1):
+    """창 목록을 50 Hz 입력과 노이즈 시드로 바꾼다. 창마다 n_seeds개의 노이즈 시드를 쓴다.
+    반환: inputs, seeds, owners(입력 → 창 번호)"""
+    inputs, seeds, owners = [], [], []
+    for j, raw in enumerate(items):
+        it = as_item(raw)
+        inp = it if "t" in it else window_inputs(it["df"])
+        base = int(it.get("seed", NOISE_SEED_BASE + j))
+        for r in range(n_seeds):
+            inputs.append(inp); seeds.append(base + SEED_STRIDE*r); owners.append(j)
+    return inputs, seeds, np.array(owners, dtype=int)
+
+
+def objective_key(objective: str) -> str:
+    return "score_c" if objective == OBJ_CONSTRAINED else "score_w"
+
+
+def evaluate(inputs, seeds, cands, fixed, objective=OBJ_CONSTRAINED, owners=None, groups=None,
+             aggregate="windows", progress_cb=None) -> dict:
+    """후보들을 평가한다.
+    - owners: 같은 창의 여러 노이즈 시드를 창 단위로 평균하기 위한 번호
+    - aggregate: "windows"(창 평균), "group_mean"(구간 평균의 평균), "group_max"(구간 평균의 최댓값)
+    반환: {"summary": 후보별 평균 지표 목록, "per_item": 지표 -> (C, 창 수) 배열}"""
+    keep = objective != OBJ_CONSTRAINED
+    W = len(inputs)
+    N = max(inp["t"].size for inp in inputs)
+    chunk = max(1, int(SERIES_BUDGET // (2 * W * N))) if keep else max(1, 120_000 // W)
+    parts = []
+    for a in range(0, len(cands), chunk):
+        part = cands[a:a + chunk]
+        cb = (lambda f, a=a, k=len(part): progress_cb((a + f*k) / len(cands))) if progress_cb else None
+        parts.append(simulate_batch(inputs, seeds, part, fixed, cb, keep_p95=keep))
+    m = {k: np.concatenate([p[k] for p in parts], axis=0) for k in METRIC_KEYS}
+    if owners is None:
+        owners = np.arange(W)
+    n_items = int(owners.max()) + 1
+    per_item = {}
+    for k in METRIC_KEYS:
+        acc = np.zeros((len(cands), n_items)); cnt = np.bincount(owners, minlength=n_items).astype(float)
+        for j in range(n_items):
+            acc[:, j] = m[k][:, owners == j].mean(axis=1)
+        per_item[k] = acc
+    per_item["lc_any"] = np.zeros((len(cands), n_items))
+    for j in range(n_items):
+        per_item["lc_any"][:, j] = m["lc"][:, owners == j].max(axis=1)
+    sk = objective_key(objective)
+    score_items = per_item[sk]
+    if aggregate == "windows" or groups is None:
+        agg = score_items.mean(axis=1)
+    else:
+        groups = np.asarray(groups)
+        gm = np.stack([score_items[:, groups == g].mean(axis=1) for g in np.unique(groups)], axis=1)
+        agg = gm.mean(axis=1) if aggregate == "group_mean" else gm.max(axis=1)
+    summary = []
+    for c in range(len(cands)):
+        s = {k: (float(np.nanmean(per_item[k][c])) if np.isfinite(per_item[k][c]).any() else float("nan")) for k in METRIC_KEYS}
+        s["lc_frac"] = float(per_item["lc_any"][c].mean())
+        s["score"] = float(agg[c])
+        summary.append(s)
+    if progress_cb:
+        progress_cb(1.0)
+    return {"summary": summary, "per_item": per_item}
+
+
+def evaluate_candidate(windows, p, fixed, objective=OBJ_WEIGHTED):
+    """이전 API 호환용: 창 목록과 후보 하나를 50 Hz로 평가한다."""
+    if not len(windows):
+        return {"score": float("inf")}
+    inputs, seeds, owners = prepare_inputs(windows)
+    return evaluate(inputs, seeds, [p], fixed, objective, owners)["summary"][0]
+
+
+def stability_variants(params: dict, fixed: dict) -> list[tuple[str, dict]]:
+    v = [("기본 조건", dict(params))]
+    for g in STAB_GAIN_FACTORS:
+        v.append((f"게인 ×{g:g} (Kp {params['kp']*g:.2f}, Kd {params['kd']*g:.3f})", dict(params, kp=params["kp"]*g, kd=params["kd"]*g)))
+    for f in STAB_TAU_FACTORS:
+        v.append((f"서보 τ ×{f:g} ({fixed['tau']*f:.3f}s)", dict(params, tau=fixed["tau"]*f)))
+    return v
+
+
+def stability_check_many(cands: list[dict], inputs, seeds, owners, fixed, progress_cb=None) -> list[dict]:
+    """3단계 stability_check를 여러 후보에 한 번에 적용한다.
+    통과 조건: 각 변형 조건에서 자세 RMS비 < 1.0, 포화율 < 5%, 기본 조건에서 리밋사이클 없음."""
+    variants = [stability_variants(c, fixed) for c in cands]
+    flat = [vp for vs in variants for _, vp in vs]
+    res = evaluate(inputs, seeds, flat, fixed, OBJ_CONSTRAINED, owners, progress_cb=progress_cb)["summary"]
+    out = []
+    i = 0
+    for c, vs in zip(cands, variants):
+        rows = []
+        for j, (name, _) in enumerate(vs):
+            s = res[i]; i += 1
+            ok = s["rms_ratio"] < 1.0 and s["saturation"] < STAB_SAT_MAX
+            note = []
+            if s["rms_ratio"] >= 1.0: note.append("RMS비 ≥ 1")
+            if s["saturation"] >= STAB_SAT_MAX: note.append("포화율 ≥ 5%")
+            if j == 0:
+                if s["lc_frac"] > 0:
+                    ok = False; note.append("리밋사이클 검출")
+            rows.append({"조건": name, "RMS비": s["rms_ratio"], "포화율(%)": 100*s["saturation"],
+                         "2Hz 이상 비율": s["hf"], "2Hz 이상 RMS(°)": s["hf_rms"], "부호변화 진동수(Hz)": s["flip_hz"],
+                         "리밋사이클 창 비율": s["lc_frac"], "판정": "통과" if ok else "실패", "사유": ", ".join(note)})
+        table = pd.DataFrame(rows)
+        out.append({"passed": bool((table["판정"] == "통과").all()), "table": table, "base": res[i - len(vs)]})
+    return out
+
+
+def stability_check(params: dict, windows_subset: list, fixed: dict) -> dict:
+    inputs, seeds, owners = prepare_inputs(windows_subset)
+    return stability_check_many([params], inputs, seeds, owners, fixed)[0]
+
+
+def sample_candidate(rng, case_fixed: dict, kd_log: bool) -> dict:
+    c = {k: float(rng.uniform(*TUNE_BOUNDS[k])) for k in TUNE_BOUNDS}
+    if kd_log:
+        c["kd"] = 0.0 if rng.uniform() < 0.1 else float(10**rng.uniform(math.log10(KD_LOG_MIN), math.log10(KD_MAX)))
+    c.update(case_fixed)
+    return c
+
+
+def perturb_candidate(rng, base: dict, case_fixed: dict, kd_log: bool) -> dict:
+    c = {}
+    for k, (lo, hi) in TUNE_BOUNDS.items():
+        c[k] = float(np.clip(base[k] + rng.normal(0, (hi-lo)*0.08), lo, hi))
+    if kd_log:
+        kd0 = max(base["kd"], KD_LOG_MIN)
+        c["kd"] = float(np.clip(math.exp(math.log(kd0) + rng.normal(0, 0.4)), 0.0, KD_MAX))
+    c.update(case_fixed)
+    return c
+
+
+def stratified_subset(n_items: int, groups, n_pick: int, rng) -> list[int]:
+    if n_items <= n_pick:
+        return list(range(n_items))
+    if groups is None:
+        return sorted(int(i) for i in rng.choice(n_items, n_pick, replace=False))
+    groups = np.asarray(groups)
+    ug = np.unique(groups)
+    per = max(1, n_pick // len(ug))
+    pick = []
+    for g in ug:
+        idx = np.where(groups == g)[0]
+        pick += [int(i) for i in rng.choice(idx, min(per, len(idx)), replace=False)]
+    return sorted(pick)
+
+
+def optimize_params(train_windows, valid_windows, current, fixed, n_trials=36, progress_cb=None,
+                    n_search=SEARCH_WINDOWS, seed=42, objective=OBJ_CONSTRAINED, case_fixed=None, kd_log=True,
+                    n_valid_seeds=VALID_NOISE_SEEDS, train_groups=None, aggregate="windows", do_stability=True):
+    """시뮬레이션 기반 자동 튜닝(무작위 탐색 + 국소 탐색).
+    - 탐색 단계: 학습창 중 n_search개(시드에 따라 정해지는 무작위)만 사용
+    - 최종 검증: 검증창 전체 × 노이즈 시드 n_valid_seeds개 평균
+    - 최종 추천값은 stability_check를 통과한 후보 중 점수가 가장 좋은 것
+    - 모든 평가는 실시간 재생과 같은 50 Hz 루프(simulate_batch)"""
+    case_fixed = dict(case_fixed or {})
+    rng = np.random.default_rng(seed)
+    sub_rng = np.random.default_rng(SUBSET_SEED + seed)
+    search_idx = stratified_subset(len(train_windows), train_groups, n_search, sub_rng)
+    search_items = [train_windows[i] for i in search_idx]
+    s_groups = None if train_groups is None else np.asarray(train_groups)[search_idx]
+    s_in, s_seed, s_own = prepare_inputs(search_items)
+    v_in, v_seed, v_own = prepare_inputs(valid_windows, n_valid_seeds)
+
+    start = dict(current); start.update(case_fixed)
+    candidates = [start]
     n_random = max(15, n_trials-9)
     for _ in range(n_random):
-        candidates.append({k: float(rng.uniform(*TUNE_BOUNDS[k])) for k in TUNE_BOUNDS})
-    scored = []
-    total = len(candidates) + 8
-    for i, candidate in enumerate(candidates):
-        metrics = evaluate_candidate(train_windows, candidate, fixed)
-        scored.append((metrics["score"], candidate, metrics))
-        if progress_cb: progress_cb((i+1)/total, f"전역 탐색 {i+1}/{total}")
-    scored.sort(key=lambda x: x[0])
-    # Local refinement around the top four candidates.
-    top = scored[:4]
-    local_candidates = []
-    for _, base, _ in top:
-        for _ in range(2):
-            c = {}
-            for k, (lo, hi) in TUNE_BOUNDS.items():
-                span = hi-lo
-                c[k] = float(np.clip(base[k] + rng.normal(0, span*0.08), lo, hi))
-            local_candidates.append(c)
-    for j, candidate in enumerate(local_candidates):
-        metrics = evaluate_candidate(train_windows, candidate, fixed)
-        scored.append((metrics["score"], candidate, metrics))
-        if progress_cb: progress_cb((len(candidates)+j+1)/total, f"상위 후보 정밀 탐색 {j+1}/{len(local_candidates)}")
-    scored.sort(key=lambda x: x[0])
-    best_score, best_params, train_metrics = scored[0]
-    current_train = evaluate_candidate(train_windows, current, fixed)
-    best_valid = evaluate_candidate(valid_windows, best_params, fixed)
-    current_valid = evaluate_candidate(valid_windows, current, fixed)
-    top_rows = []
-    for rank, (score, pars, met) in enumerate(scored[:10], 1):
-        top_rows.append({"순위": rank, "FF": pars["ff"], "Kp": pars["kp"], "Kd": pars["kd"],
-                         "α": pars["alpha"], "학습 점수": score,
-                         "Roll RMS": met["roll_rms"], "Pitch RMS": met["pitch_rms"],
-                         "Roll 최대각": met["roll_max"], "Pitch 최대각": met["pitch_max"],
-                         "서보 속도 사용률(%)": 100*met["rate_usage"],
-                         "서보 포화율(%)": 100*met["saturation"]})
-    return {"best": best_params, "train": train_metrics, "valid": best_valid,
-            "current_train": current_train, "current_valid": current_valid,
-            "top": pd.DataFrame(top_rows), "n_candidates": len(scored)}
+        candidates.append(sample_candidate(rng, case_fixed, kd_log))
+    total = len(candidates) + 8 + (STAB_TOP_K if do_stability else 0) + 2
+
+    def stage(frac0, count, label):
+        if not progress_cb:
+            return None
+        return lambda f: progress_cb(min((frac0 + f*count)/total, 1.0), f"{label}")
+    ev = evaluate(s_in, s_seed, candidates, fixed, objective, s_own, s_groups, aggregate,
+                  stage(0, len(candidates), f"전역 탐색 · 후보 {len(candidates)}개 · 학습창 {len(search_items)}개 · 50Hz"))
+    records = [(m["score"], c, m, "전역 탐색") for c, m in zip(candidates, ev["summary"])]
+    ranked = sorted(records, key=lambda x: x[0])
+    local_candidates = [perturb_candidate(rng, base, case_fixed, kd_log) for _, base, _, _ in ranked[:4] for _ in range(2)]
+    ev2 = evaluate(s_in, s_seed, local_candidates, fixed, objective, s_own, s_groups, aggregate,
+                   stage(len(candidates), len(local_candidates), "상위 후보 국소 탐색"))
+    records += [(m["score"], c, m, "국소 탐색") for c, m in zip(local_candidates, ev2["summary"])]
+    history, best_so_far = [], float("inf")
+    for i, (sc, _, _, _) in enumerate(records, 1):
+        best_so_far = min(best_so_far, sc)
+        history.append({"평가 횟수": i, "점수": sc, "최고 점수": best_so_far})
+    ranked = sorted(records, key=lambda x: x[0])
+
+    stab_results = {}
+    best_rec, stable = ranked[0], None
+    if do_stability:
+        k_in, k_seed, k_own = prepare_inputs(search_items[:STAB_WINDOWS])
+        top = ranked[:STAB_TOP_K]
+        checks = stability_check_many([r[1] for r in top], k_in, k_seed, k_own, fixed,
+                                      stage(len(candidates)+8, STAB_TOP_K, "상위 후보 안정성 검사"))
+        for r, chk in zip(top, checks):
+            stab_results[id(r[1])] = chk
+        passing = [r for r in top if stab_results[id(r[1])]["passed"]]
+        stable = bool(passing)
+        best_rec = passing[0] if passing else ranked[0]
+    best_score, best_params, train_metrics, _ = best_rec
+    current_train = records[0][2]
+    vres = evaluate(v_in, v_seed, [best_params, dict(current)], fixed, objective, v_own,
+                    progress_cb=stage(total-2, 2, f"최종 검증 · 검증창 {len(valid_windows)}개 × 노이즈 시드 {n_valid_seeds}개"))
+    best_valid, current_valid = vres["summary"]
+    all_rows = []
+    for i, (sc, c, m, phase) in enumerate(records, 1):
+        chk = stab_results.get(id(c))
+        all_rows.append({"평가 순서": i, "단계": phase, "FF": c["ff"], "Kp": c["kp"], "Kd": c["kd"], "α": c["alpha"],
+                         "학습 점수": sc, "자세 RMS비": m["rms_ratio"], "Roll RMS(°)": m["roll_rms"], "Pitch RMS(°)": m["pitch_rms"],
+                         "Roll 최대각(°)": m["roll_max"], "Pitch 최대각(°)": m["pitch_max"],
+                         "서보 각속도 RMS(정규화)": m["rate_rms"], "서보 각가속도 RMS(정규화)": m["acc_rms"],
+                         "2Hz 이상 비율": m["hf"], "부호변화 진동수(Hz)": m["flip_hz"], "리밋사이클 창 비율": m["lc_frac"],
+                         "서보 포화율(%)": 100*m["saturation"],
+                         "안정성 검사": "-" if chk is None else ("통과" if chk["passed"] else "실패"),
+                         "추천": c is best_params})
+    all_df = pd.DataFrame(all_rows)
+    top_df = all_df.sort_values("학습 점수").head(10).reset_index(drop=True)
+    top_df.insert(0, "순위", range(1, len(top_df)+1))
+    usage = {"search_used": len(search_items), "train_total": len(train_windows),
+             "valid_used": len(valid_windows), "valid_total": len(valid_windows), "valid_seeds": n_valid_seeds,
+             "search_steps": int(sum(i["t"].size for i in s_in)),
+             "valid_steps": int(sum(i["t"].size for i in v_in)),
+             "search_evals": len(records), "valid_evals": 2,
+             "stab_windows": min(STAB_WINDOWS, len(search_items)) if do_stability else 0}
+    return {"best": {k: float(best_params[k]) for k in TUNE_KEYS}, "train": train_metrics, "valid": best_valid,
+            "current_train": current_train, "current_valid": current_valid, "top": top_df, "all": all_df,
+            "history": pd.DataFrame(history), "n_candidates": len(records), "usage": usage, "seed": seed,
+            "objective": objective, "case_fixed": case_fixed, "kd_log": kd_log, "stable": stable,
+            "stability": stab_results.get(id(best_params)), "fixed": dict(fixed)}
+
+
+def pareto_mask(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """두 지표를 모두 작게 하는 비지배해(파레토 해)."""
+    keep = np.ones(len(x), bool)
+    for i in range(len(x)):
+        dominated = (x <= x[i]) & (y <= y[i]) & ((x < x[i]) | (y < y[i]))
+        if dominated.any():
+            keep[i] = False
+    return keep
+
+
+def grid_scan(ff: float, alpha: float, kps, kds, items, fixed, objective, progress_cb=None) -> dict:
+    """4단계: FF·α 고정, Kp×Kd 격자 평가 + 각 칸의 stability_check."""
+    inputs, seeds, owners = prepare_inputs(items)
+    cands = [{"ff": ff, "kp": float(a), "kd": float(b), "alpha": alpha} for a in kps for b in kds]
+    checks = stability_check_many(cands, inputs, seeds, owners, fixed, progress_cb)
+    shape = (len(kps), len(kds))
+    ratio = np.array([c["base"]["rms_ratio"] for c in checks]).reshape(shape)
+    passed = np.array([c["passed"] for c in checks]).reshape(shape)
+    sat = np.array([c["base"]["saturation"] for c in checks]).reshape(shape)
+    if objective == OBJ_CONSTRAINED:
+        score = np.array([c["base"]["score_c"] for c in checks]).reshape(shape)
+    else:
+        ev = evaluate(inputs, seeds, cands, fixed, objective, owners)
+        score = np.array([s["score"] for s in ev["summary"]]).reshape(shape)
+    return {"kps": np.asarray(kps), "kds": np.asarray(kds), "ratio": ratio, "passed": passed, "sat": sat,
+            "score": score, "ff": ff, "alpha": alpha, "n_windows": len(items)}
+
+
+def sensitivity_curves(base: dict, items, fixed, objective, n=13, kd_max_view=0.30, progress_cb=None) -> pd.DataFrame:
+    """4단계 1D 민감도: 나머지를 base로 고정하고 한 파라미터만 범위 전체에서 바꾼다(Kd는 슬라이더 최대 0.30까지)."""
+    inputs, seeds, owners = prepare_inputs(items)
+    ranges = {"ff": (0.0, 1.2), "kp": (0.0, 4.0), "kd": (0.0, kd_max_view), "alpha": (0.90, 0.999)}
+    cands, meta = [], []
+    for k, (lo, hi) in ranges.items():
+        for v in np.linspace(lo, hi, n):
+            c = dict(base); c[k] = float(v); cands.append(c); meta.append((k, float(v)))
+    ev = evaluate(inputs, seeds, cands, fixed, objective, owners, progress_cb=progress_cb)["summary"]
+    return pd.DataFrame([{"파라미터": k, "값": v, "점수": s["score"], "자세 RMS비": s["rms_ratio"],
+                          "포화율(%)": 100*s["saturation"], "리밋사이클 창 비율": s["lc_frac"]}
+                         for (k, v), s in zip(meta, ev)])
+
+
+# -----------------------------------------------------------------------------
+# 5단계: 해상상태별 튜닝, 전이 행렬, 공통 게인
+# -----------------------------------------------------------------------------
+TP_DEFAULT_EDGES = (6.0, 9.0, 12.0)
+PRIOR_DEFAULT_EDGES = "0.5, 1.0, 2.0"
+
+
+def wmo_label(code) -> str:
+    if code is None:
+        return "파랑 자료 없음"
+    c = [w for w in WMO_CODES if w[0] == code][0]
+    rng_txt = "Hs 0 m" if code == 0 else (f"Hs > {c[1]:g} m" if not np.isfinite(c[2]) else f"Hs {c[1]:g}~{c[2]:g} m")
+    return f"WMO {code} {c[3]} ({rng_txt})"
+
+
+def tp_bin(tp: float, edges) -> int | None:
+    if tp is None or not np.isfinite(tp):
+        return None
+    return int(np.searchsorted(np.asarray(edges), tp, side="right"))
+
+
+def tp_label(b: int, edges) -> str:
+    e = list(edges)
+    if b == 0: return f"Tp < {e[0]:g} s"
+    if b == len(e): return f"Tp ≥ {e[-1]:g} s"
+    return f"Tp {e[b-1]:g}~{e[b]:g} s"
+
+
+def parse_edges(text: str) -> list[float]:
+    vals = sorted({float(x) for x in re.split(r"[,\s]+", text.strip()) if x})
+    if not vals:
+        raise ValueError("구간 경계를 하나 이상 입력해 주세요.")
+    return vals
+
+
+def assign_bins(items: list[dict], criterion: str, tp_edges, prior_minutes: int, prior_edges) -> tuple[list, dict]:
+    """5-3: 창마다 구간 키를 붙인다. 쓸 수 없는 창은 None.
+    반환: 창별 키 목록, 키 -> {"order", "label", "short"}"""
+    keys, info = [], {}
+    for it in items:
+        k = None
+        if criterion.startswith("A"):
+            if it.get("wave_ok") and it.get("wmo") is not None:
+                k = ("WMO", it["wmo"])
+                info[k] = {"order": (it["wmo"],), "label": wmo_label(it["wmo"]), "short": f"WMO {it['wmo']}", "codes": [it["wmo"]]}
+        elif criterion.startswith("B"):
+            b = tp_bin(it.get("Tp"), tp_edges) if it.get("wave_ok") else None
+            if b is not None:
+                k = ("TP", b)
+                info[k] = {"order": (b,), "label": tp_label(b, tp_edges), "short": tp_label(b, tp_edges)}
+        elif criterion.startswith("C"):
+            b = tp_bin(it.get("Tp"), tp_edges) if it.get("wave_ok") else None
+            if b is not None and it.get("wmo") is not None:
+                k = ("WMOxTP", it["wmo"], b)
+                info[k] = {"order": (it["wmo"], b), "label": f"WMO {it['wmo']} × {tp_label(b, tp_edges)}",
+                           "short": f"W{it['wmo']}·{tp_label(b, tp_edges)}"}
+        else:
+            v = it.get("prior", {}).get(prior_minutes, np.nan)
+            if np.isfinite(v):
+                b = int(np.searchsorted(np.asarray(prior_edges), v, side="right"))
+                e = prior_edges
+                lab = (f"직전 {prior_minutes}분 기울기 RMS < {e[0]:g}°" if b == 0 else
+                       f"직전 {prior_minutes}분 기울기 RMS ≥ {e[-1]:g}°" if b == len(e) else
+                       f"직전 {prior_minutes}분 기울기 RMS {e[b-1]:g}~{e[b]:g}°")
+                k = ("IMU", b)
+                info[k] = {"order": (b,), "label": lab, "short": lab.replace(f"직전 {prior_minutes}분 기울기 RMS ", "")}
+        keys.append(k)
+    return keys, info
+
+
+def merge_bins(keys: list, info: dict, items: list[dict], min_train: int, min_valid: int):
+    """학습창/검증창이 부족한 구간을 순서상 인접한 구간과 합친다. 반환: 창별 그룹 번호, 그룹 정보, 병합 기록"""
+    order = sorted(info, key=lambda k: info[k]["order"])
+    groups = [[k] for k in order]
+
+    def counts(g):
+        tr = sum(1 for kk, it in zip(keys, items) if kk in g and not it["validation"])
+        va = sum(1 for kk, it in zip(keys, items) if kk in g and it["validation"])
+        return tr, va
+    log = []
+    while len(groups) > 1:
+        bad = [i for i, g in enumerate(groups) if counts(g)[0] < min_train or counts(g)[1] < min_valid]
+        if not bad:
+            break
+        i = bad[0]
+        if i == 0:
+            j = 1
+        elif i == len(groups) - 1:
+            j = i - 1
+        else:
+            j = i - 1 if sum(counts(groups[i-1])) <= sum(counts(groups[i+1])) else i + 1
+        a, b = sorted((i, j))
+        before = (group_label(groups[a], info), group_label(groups[b], info))
+        groups[a] = groups[a] + groups[b]
+        del groups[b]
+        log.append(f"{before[0]} + {before[1]} → {group_label(groups[a], info)}")
+    key_to_group = {k: gi for gi, g in enumerate(groups) for k in g}
+    gid = [key_to_group.get(k) if k is not None else None for k in keys]
+    ginfo = []
+    for gi, g in enumerate(groups):
+        tr, va = counts(g)
+        ginfo.append({"id": gi, "keys": g, "label": group_label(g, info), "n_train": tr, "n_valid": va,
+                      "enough": tr >= min_train and va >= min_valid})
+    return gid, ginfo, log
+
+
+def group_label(g: list, info: dict) -> str:
+    if len(g) == 1:
+        return info[g[0]]["label"]
+    if all(k[0] == "WMO" for k in g):
+        codes = sorted(k[1] for k in g)
+        lo = [w for w in WMO_CODES if w[0] == codes[0]][0][1]
+        hi = [w for w in WMO_CODES if w[0] == codes[-1]][0][2]
+        hi_txt = f"> {lo:g}" if not np.isfinite(hi) else f"{lo:g}~{hi:g}"
+        return f"WMO {'+'.join(str(c) for c in codes)} 병합 (Hs {hi_txt} m)"
+    return " + ".join(info[k]["short"] for k in sorted(g, key=lambda k: info[k]["order"])) + " 병합"
+
+
+def window_table(items: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame([{"창": it["id"], "날짜": it.get("date", "-"), "시작 시각(UTC)": it.get("start_time", "-"),
+                          "Hs(m)": it.get("Hs", np.nan), "Tp(s)": it.get("Tp", np.nan),
+                          "WMO 코드": it.get("wmo"), "WMO 이름": it.get("wmo_name", "-"),
+                          "매칭 시간차 최대(s)": it.get("delta_max", np.nan), "WMO 경계 걸침": it.get("boundary", False),
+                          "구분": "검증" if it["validation"] else "학습",
+                          "선박 Roll RMS(°)": it.get("roll_rms", np.nan), "선박 Pitch RMS(°)": it.get("pitch_rms", np.nan),
+                          "직전 3분 기울기 RMS(°)": it.get("prior", {}).get(3, np.nan)} for it in items])
+
+
+def run_bin_analysis(items: list[dict], gid: list, ginfo: list[dict], current: dict, fixed: dict, objective: str,
+                     case_fixed: dict, kd_log: bool, n_trials: int, n_rep: int, seed: int, progress_cb=None) -> dict:
+    """5-4, 5-5: 구간별 최적화 → 전이 행렬·regret → 공통 게인(평균형/최악형) 비교."""
+    groups = [g for g in ginfo if g["enough"]]
+    if len(groups) < 1:
+        raise ValueError("학습창/검증창 최소 개수를 만족하는 구간이 없습니다.")
+    gids = [g["id"] for g in groups]
+    tr_of = {g: [it for it, k in zip(items, gid) if k == g and not it["validation"]] for g in gids}
+    va_of = {g: [it for it, k in zip(items, gid) if k == g and it["validation"]] for g in gids}
+    jobs = len(gids) * n_rep + 2 + 1
+    done = [0]
+
+    def sub_cb(label):
+        def cb(f, msg=""):
+            if progress_cb:
+                progress_cb(min((done[0] + f) / jobs, 1.0), f"{label} · {msg}")
+        return cb
+    per_group = {}
+    for g in gids:
+        reps = []
+        for r in range(n_rep):
+            res = optimize_params(tr_of[g], va_of[g], current, fixed, n_trials, sub_cb(f"구간 '{ginfo[g]['label']}' 시드 {r+1}/{n_rep}"),
+                                  seed=seed + r, objective=objective, case_fixed=case_fixed, kd_log=kd_log)
+            reps.append(res); done[0] += 1
+        per_group[g] = reps
+    all_train = [it for g in gids for it in tr_of[g]]
+    all_groups = [g for g in gids for _ in tr_of[g]]
+    common = {}
+    for name, agg in (("평균형 공통 게인", "group_mean"), ("최악형 공통 게인", "group_max")):
+        all_valid = [it for g in gids for it in va_of[g]]
+        res = optimize_params(all_train, all_valid, current, fixed, n_trials, sub_cb(name), seed=seed,
+                              objective=objective, case_fixed=case_fixed, kd_log=kd_log,
+                              train_groups=all_groups, aggregate=agg)
+        common[name] = res; done[0] += 1
+    # 전이 행렬: 모든 게인 × 모든 구간의 검증창(노이즈 시드 VALID_NOISE_SEEDS개)
+    gains = [(f"g[{ginfo[g]['label']}]", per_group[g][0]["best"]) for g in gids]
+    gains += [(n, common[n]["best"]) for n in common] + [("현재 슬라이더 값", dict(current))]
+    v_items = [it for g in gids for it in va_of[g]]
+    v_group = np.array([g for g in gids for _ in va_of[g]])
+    v_in, v_seed, v_own = prepare_inputs(v_items, VALID_NOISE_SEEDS)
+    ev = evaluate(v_in, v_seed, [c for _, c in gains], fixed, objective, v_own, progress_cb=sub_cb("전이 행렬 평가"))
+    done[0] += 1
+    sk = objective_key(objective)
+    J = np.stack([ev["per_item"][sk][:, v_group == g].mean(axis=1) for g in gids], axis=1)        # (gain, group)
+    R = np.stack([ev["per_item"]["rms_ratio"][:, v_group == g].mean(axis=1) for g in gids], axis=1)
+    S = np.stack([ev["per_item"]["saturation"][:, v_group == g].mean(axis=1) for g in gids], axis=1)
+    own = np.array([J[i, i] for i in range(len(gids))])
+    regret = J / own[None, :] - 1.0
+    rows = []
+    for i, g in enumerate(gids):
+        reps = per_group[g]
+        b = np.array([[r["best"][k] for k in TUNE_KEYS] for r in reps])
+        gw = [it for it, k in zip(items, gid) if k == g]
+        hs = np.array([it["Hs"] for it in gw], float); tp = np.array([it["Tp"] for it in gw], float)
+        rows.append({"구간": ginfo[g]["label"], "학습창": ginfo[g]["n_train"], "검증창": ginfo[g]["n_valid"],
+                     "Hs 평균(m)": np.nanmean(hs) if np.isfinite(hs).any() else np.nan, "Hs 표준편차": np.nanstd(hs) if np.isfinite(hs).any() else np.nan,
+                     "Tp 평균(s)": np.nanmean(tp) if np.isfinite(tp).any() else np.nan, "Tp 표준편차": np.nanstd(tp) if np.isfinite(tp).any() else np.nan,
+                     "FF": reps[0]["best"]["ff"], "Kp": reps[0]["best"]["kp"], "Kd": reps[0]["best"]["kd"], "α": reps[0]["best"]["alpha"],
+                     "FF 시드 표준편차": b[:, 0].std(), "Kp 시드 표준편차": b[:, 1].std(), "Kd 시드 표준편차": b[:, 2].std(), "α 시드 표준편차": b[:, 3].std(),
+                     "검증 RMS비": R[i, i], "포화율(%)": 100*S[i, i],
+                     "안정성 검사": "통과" if reps[0]["stable"] else "실패(통과 후보 없음)"})
+    labels = [ginfo[g]["label"] for g in gids]
+    comp = []
+    n_g = len(gids)
+    for j, g in enumerate(gids):
+        row = {"구간": labels[j]}
+        for name, gi in (("구간별 게인", j), ("평균형 공통", n_g), ("최악형 공통", n_g + 1), ("현재 슬라이더 값", n_g + 2)):
+            row[f"{name} RMS비"] = R[gi, j]; row[f"{name} 포화율(%)"] = 100*S[gi, j]; row[f"{name} regret(%)"] = 100*regret[gi, j]
+        comp.append(row)
+    comp = pd.DataFrame(comp)
+    summary = []
+    for name, gi in (("평균형", n_g), ("최악형", n_g + 1), ("현재 슬라이더 값", n_g + 2)):
+        j = int(np.argmax(regret[gi])); prefix = "공통 게인" if name != "현재 슬라이더 값" else ""
+        summary.append(f"{prefix}({name}) 사용 시 최대 regret {100*regret[gi, j]:.1f}% ({labels[j]})" if prefix else
+                       f"현재 슬라이더 값 사용 시 최대 regret {100*regret[gi, j]:.1f}% ({labels[j]})")
+    return {"labels": labels, "gain_names": [n for n, _ in gains], "J": J, "R": R, "S": S, "regret": regret,
+            "table": pd.DataFrame(rows), "comparison": comp, "summary": summary,
+            "common": {n: common[n]["best"] for n in common}, "objective": objective}
+
+
+# -----------------------------------------------------------------------------
+# 5-6: 가상 파도 대조 실험 (가상 파도는 실선 RAO 모델이 아님)
+# -----------------------------------------------------------------------------
+VIRTUAL_HS = (0.9, 1.9, 3.2, 5.0)     # WMO 3~6 대표값
+VIRTUAL_TP = (6.0, 8.0, 10.0, 12.0)
+
+
+def virtual_gain_for(hs: float) -> float:
+    """기존 가상 모드 프리셋(Hs 0.5/2/4 m → 배율 0.6/2.0/3.5)을 Hs에 대해 선형 보간·외삽한 흔들림 배율."""
+    xs, ys = (0.5, 2.0, 4.0), (0.6, 2.0, 3.5)
+    if hs > xs[-1]:
+        return ys[-1] + (hs - xs[-1]) * (ys[-1] - ys[-2]) / (xs[-1] - xs[-2])
+    return float(np.interp(hs, xs, ys))
+
+
+def virtual_window(hs: float, tp: float, realization: int, duration: float, gain_mult: float, direction: float = 25.0) -> dict:
+    """virtual_motion과 같은 식을 시간 배열로 계산한 가상 창(충격 없음)."""
+    comps = wave_components(tp, hs, 5, seed=123 + 31*realization)
+    n = int(round(duration / CONTROL_DT))
+    t = np.arange(n) * CONTROL_DT
+    freqs, amps, phases, spread = comps
+    th = np.deg2rad(direction) + spread
+    w = 2*np.pi*freqs; k = w*w/G
+    ang = -w[None, :]*t[:, None] + phases[None, :]
+    slope = -amps*k*np.sin(ang); slope_rate = amps*k*w*np.cos(ang)
+    scale = np.rad2deg(0.75) * virtual_gain_for(hs) * gain_mult
+    roll = (slope*np.sin(th)).sum(1)*scale; pitch = (slope*np.cos(th)).sum(1)*scale
+    rr = (slope_rate*np.sin(th)).sum(1)*scale; pr = (slope_rate*np.cos(th)).sum(1)*scale
+    acc = amps*w*w*np.sin(ang)
+    ax = 0.5*(acc*np.cos(th)).sum(1); ay = 0.5*(acc*np.sin(th)).sum(1)
+    acc_err = np.stack([np.rad2deg(np.arctan(ay/G)), -np.rad2deg(np.arctan(ax/G))])
+    return {"t": t, "ship": np.stack([roll, pitch]), "rate": np.stack([rr, pr]), "acc": acc_err,
+            "init": (float(roll[0]), float(pitch[0])), "duration": float(t[-1])}
+
+
+def run_virtual_analysis(current: dict, fixed: dict, objective: str, case_fixed: dict, kd_log: bool, n_trials: int,
+                         n_train: int, duration: float, gain_mult: float, seed: int, progress_cb=None) -> dict:
+    conds = [(hs, tp) for hs in VIRTUAL_HS for tp in VIRTUAL_TP]
+    fixed_v = dict(fixed, accel_disturb=0.0)   # 실시간 가상 모드도 추가 가속도 오염은 쓰지 않는다
+    train_of, valid_of = {}, {}
+    for ci, (hs, tp) in enumerate(conds):
+        train_of[ci] = [dict(virtual_window(hs, tp, r, duration, gain_mult), seed=NOISE_SEED_BASE + 100*ci + r) for r in range(n_train)]
+        valid_of[ci] = [dict(virtual_window(hs, tp, 50, duration, gain_mult), seed=NOISE_SEED_BASE + 100*ci + 50)]
+    best = {}
+    for ci, (hs, tp) in enumerate(conds):
+        cb = (lambda f, m, ci=ci: progress_cb((ci + f) / (len(conds) + 1), f"Hs {conds[ci][0]} m · Tp {conds[ci][1]:g} s · {m}")) if progress_cb else None
+        res = optimize_params(train_of[ci], valid_of[ci], current, fixed_v, n_trials, cb, seed=seed, objective=objective,
+                              case_fixed=case_fixed, kd_log=kd_log, n_valid_seeds=1)
+        best[ci] = res
+    v_items = [valid_of[ci][0] for ci in range(len(conds))]
+    v_in, v_seed, v_own = prepare_inputs(v_items, VALID_NOISE_SEEDS)
+    ev = evaluate(v_in, v_seed, [best[ci]["best"] for ci in range(len(conds))], fixed_v, objective, v_own,
+                  progress_cb=(lambda f: progress_cb((len(conds) + f) / (len(conds) + 1), "전이 행렬 평가")) if progress_cb else None)
+    J = ev["per_item"][objective_key(objective)]                # (gain i, condition j)
+    regret = J / np.diag(J)[None, :] - 1.0
+    rows = []
+    for ci, (hs, tp) in enumerate(conds):
+        b = best[ci]["best"]; c, name = classify_sea_state(hs)
+        rows.append({"Hs(m)": hs, "Tp(s)": tp, "WMO": f"{c} {name}", "FF": b["ff"], "Kp": b["kp"], "Kd": b["kd"], "α": b["alpha"],
+                     "검증 RMS비": ev["per_item"]["rms_ratio"][ci, ci], "포화율(%)": 100*ev["per_item"]["saturation"][ci, ci],
+                     "안정성 검사": "통과" if best[ci]["stable"] else "실패"})
+    table = pd.DataFrame(rows)
+    same_hs = [regret[i, j] for i, (h1, t1) in enumerate(conds) for j, (h2, t2) in enumerate(conds) if h1 == h2 and t1 != t2]
+    same_tp = [regret[i, j] for i, (h1, t1) in enumerate(conds) for j, (h2, t2) in enumerate(conds) if t1 == t2 and h1 != h2]
+    infl = []
+    for k, span in (("FF", 1.2), ("Kp", 4.0), ("Kd", KD_MAX), ("α", 0.099)):
+        piv = table.pivot(index="Hs(m)", columns="Tp(s)", values=k).to_numpy()
+        infl.append({"파라미터": k, "Hs 고정·Tp 변화 시 표준편차(범위 대비 %)": 100*np.mean(piv.std(axis=1))/span,
+                     "Tp 고정·Hs 변화 시 표준편차(범위 대비 %)": 100*np.mean(piv.std(axis=0))/span})
+    infl = pd.DataFrame(infl)
+    m_hs, m_tp = 100*float(np.mean(same_hs)), 100*float(np.mean(same_tp))
+    verdict = ("Tp(주기)" if m_hs > m_tp else "Hs(파고)")
+    summary = (f"같은 Hs에서 Tp가 다른 조건의 게인을 쓰면 평균 regret {m_hs:.1f}%, 같은 Tp에서 Hs가 다른 조건의 게인을 쓰면 평균 regret {m_tp:.1f}% → "
+               f"이 가상 모델에서는 {verdict} 쪽이 최적 게인에 더 큰 영향을 줍니다.")
+    return {"conds": conds, "table": table, "J": J, "regret": regret, "influence": infl, "summary": summary,
+            "regret_same_hs": m_hs, "regret_same_tp": m_tp}
+
+
+def consistency_check(segment: pd.DataFrame, params: dict, fixed: dict, seed: int = NOISE_SEED_BASE) -> pd.DataFrame:
+    """같은 구간·같은 파라미터·같은 노이즈 시드에서
+    (1) 자동 튜닝 평가(simulate_batch) RMS와 (2) 실시간 재생(actual_motion_at + control_step, live_panel과 같은 루프) RMS를 비교한다.
+    RMS 계산식은 live_performance와 같다: sqrt(mean(x*x))."""
+    seg = segment.copy().reset_index(drop=True)
+    el = seg["elapsed_s"].to_numpy(dtype=float)
+    seg["elapsed_s"] = el - el[0]
+    for c in ("heading", "north_speed", "east_speed"):
+        if c not in seg:
+            seg[c] = np.nan
+    if "timestamp" not in seg:
+        seg["timestamp"] = None
+    if "roll_rate" not in seg:
+        seg["roll_rate"] = np.gradient(seg["ship_roll"].to_numpy(float), seg["elapsed_s"].to_numpy(float))
+        seg["pitch_rate"] = np.gradient(seg["ship_pitch"].to_numpy(float), seg["elapsed_s"].to_numpy(float))
+    inp = window_inputs(seg)
+    m = simulate_batch([inp], [seed], [params], fixed)
+    sim = new_sim_state((seg["ship_roll"].iloc[0], seg["ship_pitch"].iloc[0]), seed=seed)
+    duration = float(seg["elapsed_s"].iloc[-1])
+    p = {"ff": params["ff"], "kp": params["kp"], "kd": params["kd"], "alpha": params["alpha"],
+         "tau": fixed["tau"], "rate": float(fixed["rate"]), "limit": fixed["limit"],
+         "gyro_noise": fixed["gyro_noise"], "gyro_bias": fixed["gyro_bias"], "acc_noise": fixed["acc_noise"]}
+    rows = []
+    while sim["t"] < duration:
+        motion = actual_motion_at(sim["t"], seg)
+        rows.append(control_step(sim, motion, p, True, fixed.get("accel_disturb", 0.0), CONTROL_DT))
+    live = pd.DataFrame(rows)
+    out = []
+    for axis, label in (("roll", "Roll"), ("pitch", "Pitch")):
+        s_ = live[f"ship_{axis}"].to_numpy(float); p_ = live[f"plate_{axis}"].to_numpy(float)
+        live_rms = float(np.sqrt(np.mean(p_*p_))); live_ship = float(np.sqrt(np.mean(s_*s_)))
+        tune_rms = float(m[f"{axis}_rms"][0, 0])
+        diff = abs(tune_rms - live_rms) / max(live_rms, 1e-12)
+        out.append({"축": label, "스텝 수(튜닝/실시간)": f"{int(m['steps'][0, 0]):,} / {len(live):,}",
+                    "보정 전 RMS(°)": live_ship, "튜닝 평가 RMS(°)": tune_rms, "실시간 재생 RMS(°)": live_rms,
+                    "튜닝 평가 RMS비": tune_rms / max(live_ship, 1e-12), "실시간 RMS비": live_rms / max(live_ship, 1e-12),
+                    "차이(%)": 100*diff, "판정(≤5%)": "통과" if diff <= CONSISTENCY_TOL else "실패"})
+    return pd.DataFrame(out)
+
+
+def consistency_windows(seg: pd.DataFrame, count: int, window_rows: int = 240) -> list[pd.DataFrame]:
+    """현재 재생 구간에서 튜닝 창과 같은 방식(최대 240개 기록, 속도는 창 안에서 다시 계산)으로 검증 창을 뽑는다."""
+    n = len(seg)
+    if n < 60:
+        return []
+    length = min(window_rows, n)
+    starts = sorted(set(int(x) for x in np.linspace(0, n - length, count)))
+    out = []
+    for a in starts:
+        w = seg.iloc[a:a + length].copy().reset_index(drop=True)
+        el = w["elapsed_s"].to_numpy(float)
+        w["roll_rate"] = np.gradient(w["ship_roll"].to_numpy(float), el)
+        w["pitch_rate"] = np.gradient(w["ship_pitch"].to_numpy(float), el)
+        out.append(w)
+    return out
 
 
 def apply_best_parameters():
@@ -818,7 +1551,7 @@ st.markdown("""
 """,unsafe_allow_html=True)
 st.title("선박 2축 안정화 시뮬레이터 (2)")
 st.caption("가상 파도 시험 + Akademik Tryoshnikov 전체 항해 기록 자동 재생 + 제어 파라미터 자동 최적화")
-st.caption("빌드 버전: FULL-DATA-AUTODOWNLOAD-V2-(2) · 2026-11-19")
+st.caption("빌드 버전: FULL-DATA-AUTODOWNLOAD-V2-(2) · STAGE5-SEASTATE-TUNING · 2026-11-20")
 
 # Apply saved optimizer values before creating keyed widgets.
 if st.session_state.get("apply_best_on_next_run"):
@@ -1000,7 +1733,7 @@ if actual_mode:
     st.caption("Hs/Tp: Derkani et al. (2021), Zenodo DOI 10.5281/zenodo.4541564, CC BY 4.0. 선박 Heave 5분 구간과 RAO로 재구성한 해상상태 추정값입니다.")
 else:
     code,label=classify_sea_state(sea["Hs"])
-    st.caption(f"가상 조건: {sea_name} · Hs {sea['Hs']:.1f}m · Tp {sea['Tp']:.1f}s · WMO/Douglas {code} ({label})")
+    st.caption(f"가상 조건: {sea_name} · Hs {sea['Hs']:.1f}m · Tp {sea['Tp']:.1f}s · WMO {code if code is not None else '-'} ({label})")
 
 playing=sb.toggle("자동 재생",value=True,key="auto_play")
 
@@ -1089,7 +1822,7 @@ def live_panel():
         if wave and np.isfinite(wave["Hs"]):
             code,label=classify_sea_state(wave["Hs"])
             tp=f"Tp {wave['Tp']:.2f}s" if np.isfinite(wave["Tp"]) else "Tp 자료 없음"
-            st.markdown(f"**실제 항해 파랑 조건(재구성):** Hs {wave['Hs']:.2f}m · {tp} · WMO/Douglas {code} ({label})")
+            st.markdown(f"**실제 항해 파랑 조건(재구성):** Hs {wave['Hs']:.2f}m · {tp} · WMO {code if code is not None else '-'} ({label})")
             st.caption(f"파랑 기준 시각 {wave['timestamp'].strftime('%Y-%m-%d %H:%M:%S')} UTC · INS 시각 차이 {wave['delta_s']:.0f}s · 최근접 매칭, 보간 없음")
         else:
             st.warning("현재 INS 시각과 180초 이내에 일치하는 Hs/Tp 기록이 없습니다.")
@@ -1124,67 +1857,466 @@ live_panel()
 # -----------------------------------------------------------------------------
 # Auto tuner UI (available in actual mode only)
 # -----------------------------------------------------------------------------
+fixed={"tau":tau,"rate":float(rate),"limit":limit,"gyro_noise":gyro_noise,
+       "gyro_bias":gyro_bias,"acc_noise":acc_noise,"accel_disturb":accel_disturb}
+current={"ff":ff,"kp":kp,"kd":kd,"alpha":alpha}
+HS_NOTE=("Hs/Tp는 Derkani et al.(2021)이 선박 Heave 5분 구간 스펙트럼과 RAO로 재구성한 추정값이며, "
+         "같은 시각 부표가 직접 측정한 값이 아닙니다.")
+
+
+def fmt_params(p):
+    return f"FF {p['ff']:.3f} · Kp {p['kp']:.3f} · Kd {p['kd']:.4f} · α {p['alpha']:.4f}"
+
+
+def tuning_options(prefix: str, expanded=False):
+    """자동 튜닝 공통 옵션(실험 케이스, 목적함수, 시드, Kd 로그 샘플링, 검증 노이즈 시드 수)."""
+    with st.expander("자동 튜닝 옵션", expanded=expanded):
+        o1,o2=st.columns(2)
+        case=o1.selectbox("실험 케이스",list(CASES.keys()),index=0,key=f"{prefix}_case")
+        objective=o2.selectbox("목적함수",OBJECTIVES,index=0,key=f"{prefix}_objective")
+        o3,o4,o5=st.columns(3)
+        seed=int(o3.number_input("탐색 시드",0,99999,42,1,key=f"{prefix}_seed"))
+        kd_log=o4.toggle("Kd 로그 스케일 샘플링",value=True,key=f"{prefix}_kdlog")
+        n_vs=int(o5.slider("검증 노이즈 시드 수",3,6,VALID_NOISE_SEEDS,1,key=f"{prefix}_vseeds"))
+        st.caption(f"탐색 범위: FF {TUNE_BOUNDS['ff']}, Kp {TUNE_BOUNDS['kp']}, Kd {TUNE_BOUNDS['kd']}, α {TUNE_BOUNDS['alpha']}. "
+                   f"Kd 상한 {KD_MAX}는 ④ Kp×Kd 격자에서 확인한 안정 경계(기본 τ에서 약 0.07~0.08) 바로 위입니다. "
+                   "제약 조건 방식은 자세 RMS비를 최소화하고 포화율 >1% 또는 리밋사이클이면 큰 페널티를 줍니다. "
+                   "가중합 방식은 0.45·RMS비 + 0.20·95% 잔차비 + 0.15·최대각비 + 0.05·(각속도 RMS + 각가속도 RMS + 2Hz 이상 비율 + 포화율)입니다.")
+    return {"case":case,"case_fixed":CASES[case],"objective":objective,"seed":seed,"kd_log":kd_log,"n_valid_seeds":n_vs}
+
+
+def heatmap(z, x, y, title, zlabel, zmin=None, zmax=None, text_fmt=".2f", colorscale="Viridis_r"):
+    fig=go.Figure(go.Heatmap(z=z,x=x,y=y,colorscale=colorscale,zmin=zmin,zmax=zmax,colorbar=dict(title=zlabel),
+                             text=np.vectorize(lambda v: format(v,text_fmt))(z),texttemplate="%{text}",hoverongaps=False))
+    fig.update_layout(title=title,height=max(320,60+36*len(y)),margin=dict(l=10,r=10,t=40,b=10))
+    return fig
+
+
 if actual_mode:
     st.divider()
-    st.header("실제 항해 데이터 기반 자동 제어 최적화")
+    st.header("시뮬레이션 기반 자동 튜닝(무작위 탐색 + 국소 탐색)")
     st.write("현재 준비된 전체 INS 일별 파일에서 여러 날짜·연속 구간의 대표 4분 창을 자동 추출합니다. FF, Kp, Kd, α 후보들을 반복 시뮬레이션하고 별도 날짜의 검증 데이터로 결과를 확인합니다.")
-    st.warning("최적화는 1Hz 원자료 해상도에서 수행합니다. 50Hz로 보간한 가짜 추가 측정정보를 최적화 데이터인 것처럼 사용하지 않습니다. 결과는 시뮬레이터 추천값이며 실제 장치의 검증 완료값은 아닙니다.")
+    st.warning("자동 튜닝 평가는 실시간 재생과 같은 50Hz 제어 루프, 같은 선형 보간, 같은 센서 노이즈 생성 순서를 사용합니다. "
+               "입력은 1Hz 원자료를 보간한 값이므로 기록되지 않은 고주파 운동은 포함되지 않습니다. 결과는 시뮬레이터 추천값이며 실제 장치의 검증 완료값은 아닙니다.")
+    st.caption(f"계산량 때문에 탐색 단계는 학습창 중 최대 {SEARCH_WINDOWS}개(탐색 시드로 정해지는 무작위 추출)만 쓰고, 최종 검증만 검증창 전체 × 노이즈 시드 여러 개를 씁니다.")
     c1,c2,c3=st.columns(3)
     c1.metric("튜닝 가능 일별 파일",f"{len(set(x['member'] for x in manifest)):,}")
     c2.metric("연속 구간",f"{len(manifest):,}")
     c3.metric("조정 파라미터","FF · Kp · Kd · α")
     trial_count=st.slider("자동 탐색 후보 수",24,80,40,4,key="tune_trials")
-    fixed={"tau":tau,"rate":float(rate),"limit":limit,"gyro_noise":gyro_noise,
-           "gyro_bias":gyro_bias,"acc_noise":acc_noise,"accel_disturb":accel_disturb}
-    current={"ff":ff,"kp":kp,"kd":kd,"alpha":alpha}
+    opts=tuning_options("main")
+
+    def get_pack():
+        key=f"{INS_ARCHIVE.stat().st_size}|{len(manifest)}|{len(wave_df)}"
+        if st.session_state.get("tune_pack_key")!=key:
+            with st.status("전체 항해 기간에서 튜닝 창 준비 중…",expanded=True) as status:
+                status.write("일별 파일을 전체 기간에서 균등하게 골라 대표 4분 창을 추출하고 파랑 라벨을 붙입니다.")
+                pack=make_tuning_windows(archive_path,manifest,wave_df)
+                status.update(label=f"튜닝 창 {pack['n_windows']}개 준비 완료",state="complete",expanded=False)
+            st.session_state["tune_pack"]=pack; st.session_state["tune_pack_key"]=key
+        return st.session_state["tune_pack"]
+
+    def split_items(pack):
+        tr=[it for it in pack["items"] if not it["validation"]]
+        va=[it for it in pack["items"] if it["validation"]]
+        return tr,va
+
+    def run_opt(pack, o, seed, progress=None):
+        tr,va=split_items(pack)
+        return optimize_params(tr,va,current,fixed,trial_count,progress,seed=seed,objective=o["objective"],
+                               case_fixed=o["case_fixed"],kd_log=o["kd_log"],n_valid_seeds=o["n_valid_seeds"])
+
     if st.button("전체 항해 데이터로 자동 최적값 찾기",type="primary",width="stretch"):
         try:
-            with st.status("전체 항해 구간에서 튜닝 데이터 준비 중…",expanded=True) as status:
-                status.write("모든 일별 파일에서 여러 날짜의 대표 4분 구간을 추출합니다.")
-                train_windows,valid_windows,n_days,n_windows=make_tuning_windows(archive_path,manifest)
-                status.write(f"준비 완료: {n_days}개 일별 파일 · {n_windows}개 4분 창 · 학습 {len(train_windows)}개 · 검증 {len(valid_windows)}개")
-                bar=st.progress(0.0)
-                def progress(frac,msg): bar.progress(min(frac,1.0),text=msg)
-                result=optimize_params(train_windows,valid_windows,current,fixed,trial_count,progress)
-                result["n_days"]=n_days; result["n_windows"]=n_windows
-                st.session_state["optimization_result"]=result
-                status.update(label="자동 최적화 완료",state="complete",expanded=False)
+            pack=get_pack()
+            tr,va=split_items(pack)
+            st.write(f"준비 완료: 일별 파일 {pack['days_used']}/{pack['days_total']}일 사용 · 4분 창 {pack['n_windows']}개 · 학습 {len(tr)}개 · 검증 {len(va)}개")
+            st.write(f"탐색 단계: 학습창 {min(SEARCH_WINDOWS,len(tr))}/{len(tr)}개 · 최종 검증: 검증창 {len(va)}/{len(va)}개 × 노이즈 시드 {opts['n_valid_seeds']}개 · 50Hz 평가")
+            bar=st.progress(0.0)
+            def progress(frac,msg): bar.progress(min(frac,1.0),text=msg)
+            result=run_opt(pack,opts,opts["seed"],progress)
+            result["n_days"]=pack["days_used"]; result["n_windows"]=pack["n_windows"]; result["case"]=opts["case"]
+            st.session_state["optimization_result"]=result
+            bar.progress(1.0,text="자동 튜닝 완료")
         except Exception as exc:
-            st.error(f"자동 최적화 중 오류: {exc}")
+            st.error(f"자동 튜닝 중 오류: {type(exc).__name__}: {exc}")
     result=st.session_state.get("optimization_result")
+    pack=st.session_state.get("tune_pack")
     if result:
-        st.subheader("자동 최적화 결과")
+        st.subheader("자동 튜닝 결과")
         best=result["best"]
-        st.success("추천 파라미터 탐색이 완료됐습니다. 아래 값은 시뮬레이터의 현재 센서·서보 가정값에 종속됩니다.")
+        u=result["usage"]
+        st.info(f"평가 창 사용: 탐색 단계 학습창 {u['search_used']}/{u['train_total']}개 (후보 {u['search_evals']}개 × 50Hz {u['search_steps']:,}스텝) · "
+                f"안정성 검사 학습창 {u['stab_windows']}개 · 최종 검증 검증창 {u['valid_used']}/{u['valid_total']}개 × 노이즈 시드 {u['valid_seeds']}개 · "
+                f"일별 파일 {result.get('n_days','-')}/{pack['days_total'] if pack else '-'}일 사용")
+        st.caption(f"실험 케이스: {result.get('case','-')} · 목적함수: {result['objective']} · 탐색 시드 {result['seed']} · Kd 로그 샘플링 {'ON' if result['kd_log'] else 'OFF'}")
+        if result["stable"] is False:
+            st.error("상위 후보 중 안정성 검사(게인 ×1.5/×2, 서보 τ ×0.5/×1.5, 리밋사이클)를 통과한 후보가 없습니다. 아래 값은 점수 1위이며 안정성이 보장되지 않습니다.")
+        elif result["stable"]:
+            st.success("추천 파라미터는 안정성 검사를 통과한 후보 중 점수가 가장 좋은 값입니다. 아래 값은 시뮬레이터의 현재 센서·서보 가정값에 종속됩니다.")
         mc=st.columns(4)
         mc[0].metric("추천 FF",f"{best['ff']:.3f}")
         mc[1].metric("추천 Kp",f"{best['kp']:.3f}")
-        mc[2].metric("추천 Kd",f"{best['kd']:.3f}")
+        mc[2].metric("추천 Kd",f"{best['kd']:.4f}")
         mc[3].metric("추천 α",f"{best['alpha']:.4f}")
         comp=pd.DataFrame([
-            {"검증 구분":"현재 파라미터","검증 점수":result["current_valid"]["score"],
-             "Roll RMS":"%.3f°"%result["current_valid"]["roll_rms"],"Pitch RMS":"%.3f°"%result["current_valid"]["pitch_rms"],
-             "Roll 최대각":"%.3f°"%result["current_valid"]["roll_max"],
-             "Pitch 최대각":"%.3f°"%result["current_valid"]["pitch_max"],
-             "서보 포화율":"%.2f%%"%(100*result["current_valid"]["saturation"])},
-            {"검증 구분":"추천 파라미터","검증 점수":result["valid"]["score"],
-             "Roll RMS":"%.3f°"%result["valid"]["roll_rms"],"Pitch RMS":"%.3f°"%result["valid"]["pitch_rms"],
-             "Roll 최대각":"%.3f°"%result["valid"]["roll_max"],
-             "Pitch 최대각":"%.3f°"%result["valid"]["pitch_max"],
-             "서보 포화율":"%.2f%%"%(100*result["valid"]["saturation"])},
-        ])
-        st.markdown("**학습에 사용하지 않은 검증 구간 결과**")
+            {"검증 구분":name,"검증 점수":m["score"],"자세 RMS비":m["rms_ratio"],
+             "Roll RMS":"%.3f°"%m["roll_rms"],"Pitch RMS":"%.3f°"%m["pitch_rms"],
+             "Roll 최대각":"%.3f°"%m["roll_max"],"Pitch 최대각":"%.3f°"%m["pitch_max"],
+             "서보 포화율":"%.2f%%"%(100*m["saturation"]),"리밋사이클 창 비율":"%.2f"%m["lc_frac"]}
+            for name,m in (("현재 파라미터",result["current_valid"]),("추천 파라미터",result["valid"]))])
+        st.markdown(f"**학습에 사용하지 않은 검증 구간 결과** (노이즈 시드 {u['valid_seeds']}개 평균)")
         st.dataframe(comp,hide_index=True,width="stretch")
         cur=result["current_valid"]; opt=result["valid"]
         if cur["score"]>0:
             st.metric("검증 점수 개선율",f"{100*(cur['score']-opt['score'])/cur['score']:.1f}%")
-        st.markdown("**상위 후보 10개**")
+        st.markdown("**상위 후보 10개 (탐색 단계 학습창 기준)**")
         st.dataframe(result["top"].round(4),hide_index=True,width="stretch")
         st.button("추천 파라미터를 제어 슬라이더에 적용",on_click=lambda: st.session_state.update({"apply_best_on_next_run":True}),
                   type="primary",width="stretch",key="apply_best_button")
         st.download_button("최적화 후보 및 결과 CSV 저장",result["top"].to_csv(index=False).encode("utf-8-sig"),
                            file_name="akademik_auto_tuning_candidates.csv",mime="text/csv")
         st.caption("서보 τ·최대 각속도·회전한계와 센서 노이즈/바이어스 설정은 최적화 중 고정했습니다. 이 고정값이 실제 하드웨어 사양과 측정치가 아니면 추천값의 신뢰도가 낮아집니다.")
+
+    st.subheader("튜닝 분석")
+    t1,t2,t3,t4,t5,t6=st.tabs(["① 수렴·재현성","② 전체 후보·파레토","③ 안정성 검사","④ Kp×Kd 격자·민감도","⑤ 해상상태별 튜닝","⑥ 창 목록·분포"])
+
+    # ---------------------------------------------------------------- ① convergence & reproducibility
+    with t1:
+        if result:
+            h=result["history"]
+            fig=go.Figure()
+            fig.add_trace(go.Scatter(x=h["평가 횟수"],y=h["점수"],mode="markers",name="각 후보 점수",marker=dict(color="#9AA5B1",size=6)))
+            fig.add_trace(go.Scatter(x=h["평가 횟수"],y=h["최고 점수"],mode="lines",name="지금까지 최고 점수",line=dict(color=PLATE_COLOR,width=3,shape="hv")))
+            fig.update_layout(title="평가 횟수 vs 최고 점수 (수렴 곡선)",height=330,yaxis_type="log",xaxis_title="평가 횟수",yaxis_title="학습 점수(로그)",margin=dict(l=10,r=10,t=40,b=10))
+            st.plotly_chart(fig,width="stretch",key="conv_fig")
+        else:
+            st.info("자동 튜닝을 먼저 실행하면 수렴 곡선이 나타납니다.")
+        st.markdown("**시드 반복 실험**: 같은 옵션으로 탐색 시드만 바꿔 최적화를 반복합니다(탐색용 학습창 추출도 시드에 따라 달라집니다).")
+        n_rep=st.slider("반복할 시드 수",2,10,5,1,key="seedrep_n")
+        if st.button("시드 반복 실험",key="run_seedrep"):
+            try:
+                pk=get_pack(); runs=[]
+                bar=st.progress(0.0)
+                for r in range(n_rep):
+                    res_=run_opt(pk,opts,opts["seed"]+r,lambda f,m,r=r: bar.progress(min((r+f)/n_rep,1.0),text=f"시드 {opts['seed']+r} · {m}"))
+                    runs.append(res_)
+                rows=[{"탐색 시드":r_["seed"],"FF":r_["best"]["ff"],"Kp":r_["best"]["kp"],"Kd":r_["best"]["kd"],"α":r_["best"]["alpha"],
+                       "학습 점수":r_["train"]["score"],"검증 점수":r_["valid"]["score"],"검증 RMS비":r_["valid"]["rms_ratio"],
+                       "안정성 검사":"통과" if r_["stable"] else "실패"} for r_ in runs]
+                per=pd.DataFrame(rows)
+                stats=pd.DataFrame([{"항목":k,"평균":per[k].mean(),"표준편차":per[k].std(ddof=0),"최솟값":per[k].min(),"최댓값":per[k].max()}
+                                    for k in ("FF","Kp","Kd","α","검증 점수")])
+                st.session_state["seedrep"]={"per":per,"stats":stats,"hist":[(r_["seed"],r_["history"]) for r_ in runs],"case":opts["case"],"objective":opts["objective"]}
+            except Exception as exc:
+                st.error(f"시드 반복 실험 오류: {type(exc).__name__}: {exc}")
+        sr=st.session_state.get("seedrep")
+        if sr:
+            st.caption(f"실험 케이스: {sr['case']} · 목적함수: {sr['objective']}")
+            st.dataframe(sr["stats"].round(4),hide_index=True,width="stretch")
+            st.dataframe(sr["per"].round(4),hide_index=True,width="stretch")
+            fig=go.Figure()
+            for sd,h in sr["hist"]:
+                fig.add_trace(go.Scatter(x=h["평가 횟수"],y=h["최고 점수"],mode="lines",name=f"시드 {sd}",line=dict(shape="hv")))
+            fig.update_layout(title="시드별 수렴 곡선",height=320,yaxis_type="log",xaxis_title="평가 횟수",yaxis_title="최고 점수(로그)",margin=dict(l=10,r=10,t=40,b=10))
+            st.plotly_chart(fig,width="stretch",key="seedrep_fig")
+            st.download_button("시드 반복 결과 CSV 저장",sr["per"].to_csv(index=False).encode("utf-8-sig"),file_name="seed_repeat.csv",mime="text/csv",key="dl_seedrep")
+
+    # ---------------------------------------------------------------- ② all candidates & Pareto
+    with t2:
+        if result:
+            alldf=result["all"]
+            x=alldf["서보 각속도 RMS(정규화)"].to_numpy(float); y=alldf["자세 RMS비"].to_numpy(float)
+            pm=pareto_mask(x,y)
+            fig=go.Figure()
+            lc_mask=alldf["리밋사이클 창 비율"].to_numpy(float)>0
+            fig.add_trace(go.Scatter(x=x[~lc_mask],y=y[~lc_mask],mode="markers",name="후보",marker=dict(color="#9AA5B1",size=7),
+                                     text=[f"FF {a:.2f}, Kp {b:.2f}, Kd {c:.3f}, α {d:.3f}" for a,b,c,d in alldf.loc[~lc_mask,["FF","Kp","Kd","α"]].to_numpy()]))
+            fig.add_trace(go.Scatter(x=x[lc_mask],y=y[lc_mask],mode="markers",name="리밋사이클 검출 후보",marker=dict(color=PLATE_OFF_COLOR,size=7,symbol="x")))
+            order=np.argsort(x[pm])
+            fig.add_trace(go.Scatter(x=x[pm][order],y=y[pm][order],mode="lines+markers",name="파레토 해(비지배해)",line=dict(color=PLATE_COLOR,width=2.5),marker=dict(size=9)))
+            rec=alldf["추천"].to_numpy(bool)
+            fig.add_trace(go.Scatter(x=x[rec],y=y[rec],mode="markers",name="추천값",marker=dict(color="#F2C14E",size=16,symbol="star",line=dict(color="black",width=1))))
+            fig.update_layout(title="서보 각속도 RMS(정규화) vs 자세 RMS비",height=420,xaxis_title="서보 각속도 RMS / 최대 각속도",yaxis_title="자세 RMS비(보정 후/보정 전)",
+                              yaxis_type="log",xaxis_type="log",margin=dict(l=10,r=10,t=40,b=10))
+            st.plotly_chart(fig,width="stretch",key="pareto_fig")
+            st.caption(f"평가한 후보 {len(alldf)}개 중 파레토 해 {int(pm.sum())}개. 왼쪽 아래로 갈수록 적은 서보 움직임으로 수평을 잘 유지합니다.")
+            st.dataframe(alldf.round(4),hide_index=True,width="stretch")
+            st.download_button("전체 후보 CSV 저장",alldf.to_csv(index=False).encode("utf-8-sig"),file_name="all_candidates.csv",mime="text/csv",key="dl_all")
+        else:
+            st.info("자동 튜닝을 먼저 실행하면 평가한 모든 후보가 나타납니다.")
+
+    # ---------------------------------------------------------------- ③ stability check
+    with t3:
+        st.markdown(f"**판정 기준**: 게인 (Kp, Kd) ×{STAB_GAIN_FACTORS[0]:g}·×{STAB_GAIN_FACTORS[1]:g}, 서보 τ ×{STAB_TAU_FACTORS[0]:g}·×{STAB_TAU_FACTORS[1]:g} 각각에서 "
+                    f"자세 RMS비(검사 창 전체 합산) < 1.0 이고 포화율 < {100*STAB_SAT_MAX:.0f}%. 기본 조건에서 리밋사이클이 없어야 함 "
+                    f"(관절 각속도 부호변화 진동수 > {LC_FLIP_HZ:g} Hz, 또는 2Hz 이상 성분 비율 > {LC_HF_RATIO:g} 이면서 RMS > {LC_HF_RMS:g}°이면 리밋사이클).")
+        if result and result.get("stability"):
+            st.markdown(f"**추천 파라미터** ({fmt_params(result['best'])})")
+            st.dataframe(result["stability"]["table"].round(4),hide_index=True,width="stretch")
+        if st.button("현재 슬라이더 값 안정성 검사",key="run_stab_current"):
+            try:
+                pk=get_pack(); tr,_=split_items(pk)
+                st.session_state["stab_current"]={"params":dict(current),"res":stability_check(current,tr[:STAB_WINDOWS],fixed)}
+            except Exception as exc:
+                st.error(f"안정성 검사 오류: {type(exc).__name__}: {exc}")
+        sc_=st.session_state.get("stab_current")
+        if sc_:
+            st.markdown(f"**현재 슬라이더 값** ({fmt_params(sc_['params'])}) → {'통과' if sc_['res']['passed'] else '실패'}")
+            st.dataframe(sc_["res"]["table"].round(4),hide_index=True,width="stretch")
+
+    # ---------------------------------------------------------------- ④ grid & sensitivity
+    with t4:
+        st.write("FF와 α는 사이드바 슬라이더 값으로 고정하고 Kp×Kd 격자를 평가합니다. 색은 자세 RMS비(검사 창 전체 합산), ✕는 안정성 검사 실패 칸입니다.")
+        g1,g2,g3=st.columns(3)
+        gn=g1.select_slider("격자 크기",[8,10,12],value=12,key="grid_n")
+        kd_axis=g2.radio("Kd 축",["선형","로그"],horizontal=True,key="grid_kdaxis")
+        kd_view=g3.select_slider("Kd 최대",[0.06,0.09,0.12,0.2,0.3],value=0.12,key="grid_kdmax")
+        if st.button("Kp×Kd 격자 탐색 실행",key="run_grid"):
+            try:
+                pk=get_pack(); tr,_=split_items(pk)
+                sub=tr[:6]
+                kps=np.linspace(0.0,4.0,gn)
+                kds=np.linspace(0.0,kd_view,gn) if kd_axis=="선형" else np.r_[0.0,np.geomspace(KD_LOG_MIN,kd_view,gn-1)]
+                bar=st.progress(0.0)
+                gr=grid_scan(ff,alpha,kps,kds,sub,fixed,opts["objective"],lambda f: bar.progress(min(f,1.0),text="격자 평가 중"))
+                if result:
+                    inp_,sd_,ow_=prepare_inputs(sub)
+                    gr["random_best"]=dict(result["best"])
+                    gr["random_score"]=evaluate(inp_,sd_,[result["best"]],fixed,opts["objective"],ow_)["summary"][0]["score"]
+                gr["objective"]=opts["objective"]
+                st.session_state["grid_result"]=gr
+            except Exception as exc:
+                st.error(f"격자 탐색 오류: {type(exc).__name__}: {exc}")
+        gr=st.session_state.get("grid_result")
+        if gr:
+            ratio=np.minimum(gr["ratio"],1.5)
+            xlab=[f"{v:.4f}" for v in gr["kds"]]; ylab=[f"{v:.2f}" for v in gr["kps"]]
+            fig=go.Figure(go.Heatmap(z=ratio,x=xlab,y=ylab,colorscale="Viridis_r",zmin=0,zmax=1.5,colorbar=dict(title="RMS비")))
+            fi,fj=np.where(~gr["passed"])
+            fig.add_trace(go.Scatter(x=[xlab[j] for j in fj],y=[ylab[i] for i in fi],mode="markers",name="안정성 검사 실패",
+                                     marker=dict(symbol="x",color="white",size=9,line=dict(color="black",width=1))))
+            sc=np.where(gr["passed"],gr["score"],np.inf)
+            if not np.isfinite(sc).any(): sc=gr["score"]
+            bi,bj=np.unravel_index(int(np.argmin(sc)),sc.shape)
+            fig.add_trace(go.Scatter(x=[xlab[bj]],y=[ylab[bi]],mode="markers",name="격자 최적값(안정 통과 중)",marker=dict(symbol="diamond",color=PLATE_COLOR,size=14,line=dict(color="black",width=1))))
+            txt=f"격자 최적값: Kp {gr['kps'][bi]:.2f}, Kd {gr['kds'][bj]:.4f}, 점수 {gr['score'][bi,bj]:.4f}"
+            if "random_best" in gr:
+                rb=gr["random_best"]
+                jx=int(np.argmin(np.abs(gr["kds"]-rb["kd"]))); iy=int(np.argmin(np.abs(gr["kps"]-rb["kp"])))
+                fig.add_trace(go.Scatter(x=[xlab[jx]],y=[ylab[iy]],mode="markers",name="무작위 탐색 최적값(가장 가까운 칸)",marker=dict(symbol="star",color="#F2C14E",size=16,line=dict(color="black",width=1))))
+                diff=100*(gr["random_score"]-gr["score"][bi,bj])/max(abs(gr["score"][bi,bj]),1e-12)
+                txt+=f" · 무작위 탐색 최적값({fmt_params(rb)}) 점수 {gr['random_score']:.4f} → 격자 최적 대비 {diff:+.1f}%"
+                txt+=" (무작위 탐색값은 FF·α도 튜닝했을 수 있어 음수가 나올 수 있습니다)"
+            fig.update_layout(title=f"Kp×Kd 안정 지도 (FF {gr['ff']:.2f}, α {gr['alpha']:.3f} 고정, 창 {gr['n_windows']}개)",height=480,
+                              xaxis_title="Kd (s)",yaxis_title="Kp",margin=dict(l=10,r=10,t=40,b=10))
+            st.plotly_chart(fig,width="stretch",key="grid_fig")
+            st.caption(txt+f" · 목적함수: {gr['objective']}")
+            grid_df=pd.DataFrame(gr["ratio"],index=[f"Kp={v}" for v in ylab],columns=[f"Kd={v}" for v in xlab])
+            st.download_button("격자 결과 CSV 저장",grid_df.to_csv().encode("utf-8-sig"),file_name="kp_kd_grid.csv",mime="text/csv",key="dl_grid")
+        st.markdown("**1D 민감도**: 나머지 파라미터를 자동 튜닝 최적값(없으면 현재 슬라이더 값)에 고정하고 한 파라미터만 바꿉니다. Kd는 슬라이더 최대 0.30까지 봅니다.")
+        if st.button("1D 민감도 곡선 계산",key="run_sens"):
+            try:
+                pk=get_pack(); tr,_=split_items(pk)
+                base=dict(result["best"]) if result else dict(current)
+                bar=st.progress(0.0)
+                st.session_state["sens_result"]={"base":base,"df":sensitivity_curves(base,tr[:6],fixed,opts["objective"],progress_cb=lambda f: bar.progress(min(f,1.0),text="민감도 계산 중"))}
+            except Exception as exc:
+                st.error(f"민감도 계산 오류: {type(exc).__name__}: {exc}")
+        sres=st.session_state.get("sens_result")
+        if sres:
+            sd=sres["df"]
+            fig=make_subplots(rows=1,cols=4,subplot_titles=["FF","Kp","Kd","α"],shared_yaxes=True)
+            for i,k in enumerate(["ff","kp","kd","alpha"],1):
+                part=sd[sd["파라미터"]==k]
+                fig.add_trace(go.Scatter(x=part["값"],y=part["자세 RMS비"],mode="lines+markers",name="자세 RMS비",showlegend=i==1,line=dict(color=PLATE_COLOR)),row=1,col=i)
+                lcp=part[part["리밋사이클 창 비율"]>0]
+                fig.add_trace(go.Scatter(x=lcp["값"],y=lcp["자세 RMS비"],mode="markers",name="리밋사이클",showlegend=i==1,marker=dict(color=PLATE_OFF_COLOR,symbol="x",size=9)),row=1,col=i)
+                fig.add_vline(x=sres["base"][k],line_dash="dot",line_color="gray",row=1,col=i)
+            fig.update_yaxes(type="log",title_text="자세 RMS비",row=1,col=1)
+            fig.update_layout(height=340,margin=dict(l=10,r=10,t=40,b=10),title=f"1D 민감도 (기준값 {fmt_params(sres['base'])})")
+            st.plotly_chart(fig,width="stretch",key="sens_fig")
+            st.download_button("민감도 CSV 저장",sd.to_csv(index=False).encode("utf-8-sig"),file_name="sensitivity.csv",mime="text/csv",key="dl_sens")
+
+    # ---------------------------------------------------------------- ⑤ sea-state tuning
+    with t5:
+        st.caption(HS_NOTE)
+        crit=st.radio("조건 구간 기준",["A. WMO 해상상태 코드별","B. Tp 구간별","C. Hs(WMO) × Tp 2차원","D. 하부 IMU 직전 기울기 RMS 구간"],key="bin_crit")
+        b1,b2,b3=st.columns(3)
+        e1=b1.slider("Tp 경계 1(s)",3.0,20.0,TP_DEFAULT_EDGES[0],0.5,key="tp_e1")
+        e2=b2.slider("Tp 경계 2(s)",3.0,20.0,TP_DEFAULT_EDGES[1],0.5,key="tp_e2")
+        e3=b3.slider("Tp 경계 3(s)",3.0,20.0,TP_DEFAULT_EDGES[2],0.5,key="tp_e3")
+        tp_edges=sorted({e1,e2,e3})
+        st.caption("Tp 구간: " + " / ".join(tp_label(b,tp_edges) for b in range(len(tp_edges)+1)))
+        d1,d2=st.columns(2)
+        prior_min=d1.slider("기준 D: 직전 이동 RMS 시간(분)",2,5,3,1,key="prior_min")
+        prior_txt=d2.text_input("기준 D: 기울기 RMS 경계(°, 쉼표 구분)",PRIOR_DEFAULT_EDGES,key="prior_edges")
+        m1,m2,m3,m4=st.columns(4)
+        min_tr=int(m1.number_input("구간 최소 학습창",1,50,6,1,key="bin_min_tr"))
+        min_va=int(m2.number_input("구간 최소 검증창",1,20,2,1,key="bin_min_va"))
+        bin_rep=int(m3.slider("오차막대용 시드 반복",1,5,3,1,key="bin_rep"))
+        bin_trials=int(m4.slider("구간별 탐색 후보 수",16,60,24,4,key="bin_trials"))
+        st.caption("기준 D는 장치가 Hs/Tp를 직접 측정하지 못하므로, 하부 IMU가 측정할 수 있는 직전 기울기 RMS(√(roll²+pitch²), INS 기록 기준)로 구간을 나눕니다. "
+                   "직전 자료가 부족한 창(구간 시작부 창)은 제외됩니다. 파랑 자료가 없는 창은 A~C 구간 분석에서 제외되지만 전체 성능 평가에는 포함됩니다.")
+        if pack:
+            try:
+                prior_edges=parse_edges(prior_txt)
+                keys,info=assign_bins(pack["items"],crit,tp_edges,prior_min,prior_edges)
+                gid,ginfo,log=merge_bins(keys,info,pack["items"],min_tr,min_va)
+                prev=pd.DataFrame([{"구간":g["label"],"학습창":g["n_train"],"검증창":g["n_valid"],"분석 가능":"예" if g["enough"] else "아니오(최소 개수 미달)"} for g in ginfo])
+                if crit.startswith("A"):
+                    present={k[1] for k in info}
+                    missing=[{"구간":wmo_label(c),"학습창":0,"검증창":0,"분석 가능":"자료 없음"} for c,_,_,_ in WMO_CODES if c not in present]
+                    prev=pd.concat([prev,pd.DataFrame(missing)],ignore_index=True)
+                excluded=sum(1 for k in keys if k is None)
+                st.markdown(f"**구간 미리보기** (제외된 창 {excluded}개)")
+                st.dataframe(prev,hide_index=True,width="stretch")
+                for line in log: st.caption("병합: "+line)
+            except Exception as exc:
+                st.error(f"구간 설정 오류: {exc}")
+                gid=None
+        else:
+            st.info("자동 튜닝 또는 ⑥ 탭의 '튜닝 창 준비'를 먼저 실행하면 구간 미리보기가 나타납니다.")
+            gid=None
+        if st.button("해상상태별 튜닝 실행",key="run_bins"):
+            try:
+                pk=get_pack()
+                prior_edges=parse_edges(prior_txt)
+                keys,info=assign_bins(pk["items"],crit,tp_edges,prior_min,prior_edges)
+                gid,ginfo,log=merge_bins(keys,info,pk["items"],min_tr,min_va)
+                bar=st.progress(0.0)
+                br=run_bin_analysis(pk["items"],gid,ginfo,current,fixed,opts["objective"],opts["case_fixed"],opts["kd_log"],
+                                    bin_trials,bin_rep,opts["seed"],lambda f,m: bar.progress(min(f,1.0),text=m))
+                br["criterion"]=crit; br["merge_log"]=log; br["case"]=opts["case"]
+                st.session_state["bin_result"]=br
+            except Exception as exc:
+                st.error(f"해상상태별 튜닝 오류: {type(exc).__name__}: {exc}")
+        br=st.session_state.get("bin_result")
+        if br:
+            st.markdown(f"**구간별 최적 게인** · 기준 {br['criterion']} · 케이스 {br['case']} · 목적함수 {br['objective']}")
+            for line in br["merge_log"]: st.caption("병합: "+line)
+            st.dataframe(br["table"].round(4),hide_index=True,width="stretch")
+            for line in br["summary"]: st.info(line)
+            st.plotly_chart(heatmap(br["J"],br["labels"],br["gain_names"],"전이 행렬 J(g_i, 구간 j): 행 게인을 열 구간 검증창에 적용한 점수","점수",text_fmt=".3f"),width="stretch",key="bin_J")
+            st.plotly_chart(heatmap(100*br["regret"],br["labels"],br["gain_names"],"regret(i→j) = J(g_i, j) / J(g_j*, j) − 1 (%)","regret(%)",zmin=0,text_fmt=".1f",colorscale="Reds"),width="stretch",key="bin_regret")
+            reg_df=pd.DataFrame(100*br["regret"],index=br["gain_names"],columns=br["labels"])
+            st.dataframe(reg_df.round(2),width="stretch")
+            xsel=st.radio("게인–해상상태 그래프 x축",["Hs 평균(m)","Tp 평균(s)"],horizontal=True,key="bin_xaxis")
+            tb=br["table"]
+            fig=make_subplots(rows=1,cols=3,subplot_titles=["Kp","Kd","FF"])
+            for i,(k,e) in enumerate((("Kp","Kp 시드 표준편차"),("Kd","Kd 시드 표준편차"),("FF","FF 시드 표준편차")),1):
+                fig.add_trace(go.Scatter(x=tb[xsel],y=tb[k],error_y=dict(type="data",array=tb[e]),mode="markers+text",text=tb["구간"].str.slice(0,10),
+                                         textposition="top center",marker=dict(size=10,color=PLATE_COLOR),showlegend=False),row=1,col=i)
+            fig.update_layout(height=360,margin=dict(l=10,r=10,t=40,b=10),title="구간 대표값 vs 최적 게인 (오차막대: 시드 반복 표준편차)")
+            st.plotly_chart(fig,width="stretch",key="bin_gain_fig")
+            st.markdown("**공통 게인 vs 조건별 게인** (각 칸: 검증 RMS비 · 포화율 · regret)")
+            st.dataframe(br["comparison"].round(3),hide_index=True,width="stretch")
+            st.caption("공통 게인: " + " / ".join(f"{n}: {fmt_params(p)}" for n,p in br["common"].items()))
+            c_a,c_b=st.columns(2)
+            c_a.download_button("구간별 게인 CSV",br["table"].to_csv(index=False).encode("utf-8-sig"),file_name="gains_by_sea_state.csv",mime="text/csv",key="dl_bins")
+            c_b.download_button("공통 vs 조건별 비교 CSV",br["comparison"].to_csv(index=False).encode("utf-8-sig"),file_name="common_vs_binned.csv",mime="text/csv",key="dl_bincomp")
+            st.caption(HS_NOTE+" ACE 자료는 특정 해역·기간의 기록이라 일부 WMO 코드는 자료가 없습니다.")
+
+    # ---------------------------------------------------------------- ⑥ windows & distribution
+    with t6:
+        if st.button("튜닝 창 준비",key="prep_pack"):
+            try: get_pack()
+            except Exception as exc: st.error(f"튜닝 창 준비 오류: {type(exc).__name__}: {exc}")
+        pack=st.session_state.get("tune_pack")
+        if pack:
+            wt=window_table(pack["items"])
+            st.markdown(f"**튜닝 창 목록**: 일별 파일 {pack['days_used']}/{pack['days_total']}일 사용 (균등 추출 {pack['days_chosen']}일) · 창 {pack['n_windows']}개 · 파랑 자료 없음 {int(wt['WMO 코드'].isna().sum())}개")
+            if pack["days_used"]<pack["days_total"]:
+                st.caption("창 수 상한(180개) 때문에 일부 날짜만 쓰지만, 날짜를 전체 기간에서 균등 간격으로 골라 특정 기간이 빠지지 않습니다.")
+            st.dataframe(wt.round(3),hide_index=True,width="stretch")
+            st.download_button("창 목록 CSV",wt.to_csv(index=False).encode("utf-8-sig"),file_name="tuning_windows.csv",mime="text/csv",key="dl_windows")
+            cats=[str(c) for c,_,_,_ in WMO_CODES]+["자료 없음"]
+            wt["WMO 라벨"]=wt["WMO 코드"].apply(lambda v: "자료 없음" if pd.isna(v) else str(int(v)))
+            fig=go.Figure()
+            for part,color in (("학습",SHIP_COLOR),("검증",PLATE_COLOR)):
+                cnt=wt[wt["구분"]==part]["WMO 라벨"].value_counts()
+                fig.add_trace(go.Bar(x=cats,y=[int(cnt.get(c,0)) for c in cats],name=part,marker_color=color))
+            fig.update_layout(barmode="group",title="WMO 코드별 창 개수",height=320,xaxis_title="WMO 해상상태 코드",yaxis_title="창 개수",margin=dict(l=10,r=10,t=40,b=10))
+            st.plotly_chart(fig,width="stretch",key="wmo_bar")
+            ok=wt.dropna(subset=["Hs(m)"])
+            fig=go.Figure(go.Scatter(x=ok["Tp(s)"],y=ok["Hs(m)"],mode="markers",marker=dict(color=ok["WMO 코드"],colorscale="Turbo",cmin=0,cmax=9,size=8,
+                                     colorbar=dict(title="WMO")),text=ok["날짜"]+" "+ok["시작 시각(UTC)"]))
+            fig.update_layout(title="Hs–Tp 분포 (색 = WMO 코드)",height=360,xaxis_title="Tp (s)",yaxis_title="Hs (m)",margin=dict(l=10,r=10,t=40,b=10))
+            st.plotly_chart(fig,width="stretch",key="hs_tp_fig")
+            st.caption(HS_NOTE)
+        else:
+            st.info("자동 튜닝을 실행하거나 '튜닝 창 준비'를 누르면 창 목록이 나타납니다.")
+
+    with st.expander("실시간 재생과 자동 튜닝 평가의 일치 검증 (consistency_check)", expanded=False):
+        st.write("현재 재생 중인 항해 구간에서 튜닝 창과 같은 방식으로 창을 뽑아, 같은 파라미터·같은 노이즈 시드로 "
+                 "① 자동 튜닝 평가 경로(simulate_batch)와 ② 실시간 재생 경로(actual_motion_at + control_step)를 각각 돌립니다. "
+                 f"RMS는 live_performance와 같은 식으로 계산하며 차이가 {100*CONSISTENCY_TOL:.0f}% 이내면 통과입니다.")
+        cc1,cc2=st.columns(2)
+        n_check=cc1.slider("검증 창 수",1,3,2,1,key="cc_windows")
+        cc_seed=int(cc2.number_input("노이즈 시드",0,99999,NOISE_SEED_BASE,1,key="cc_seed"))
+        if st.button("일치 검증 실행",key="run_consistency"):
+            seg_now=st.session_state.get("current_actual_df")
+            wins=consistency_windows(seg_now,n_check) if seg_now is not None else []
+            if not wins:
+                st.warning("현재 구간이 너무 짧아(60개 기록 미만) 검증 창을 만들 수 없습니다.")
+            else:
+                param_sets=[("현재 슬라이더 값",dict(current))]
+                if result: param_sets.append(("자동 튜닝 추천값",dict(result["best"])))
+                tables=[]
+                with st.spinner("두 경로를 각각 50Hz로 계산하는 중… (실시간 경로는 창당 수 초 걸립니다)"):
+                    for wi,w in enumerate(wins):
+                        for name,pars in param_sets:
+                            t_=consistency_check(w,pars,fixed,cc_seed)
+                            t_.insert(0,"파라미터",name); t_.insert(0,"창",f"{wi+1} ({len(w)}개 기록, {float(w['elapsed_s'].iloc[-1]-w['elapsed_s'].iloc[0]):.0f}s)")
+                            tables.append(t_)
+                st.session_state["consistency_result"]=pd.concat(tables,ignore_index=True)
+        cres=st.session_state.get("consistency_result")
+        if cres is not None:
+            st.dataframe(cres.round(4),hide_index=True,width="stretch")
+            worst=float(cres["차이(%)"].max())
+            if (cres["판정(≤5%)"]=="통과").all():
+                st.success(f"모든 창·파라미터에서 통과했습니다. 최대 차이 {worst:.4f}%")
+            else:
+                st.error(f"허용 차이 5%를 넘는 항목이 있습니다. 최대 차이 {worst:.2f}%")
+            st.download_button("일치 검증 결과 CSV 저장",cres.to_csv(index=False).encode("utf-8-sig"),
+                               file_name="consistency_check.csv",mime="text/csv",key="dl_consistency")
+
+else:
+    # ---------------------------------------------------------------- 5-6 virtual comparison
+    st.divider()
+    with st.expander("가상 파도 대조 실험: 해상상태별 최적 게인 (Hs × Tp)", expanded=False):
+        st.warning("가상 파도는 파도 경사 기반 단순화 모델이며 실선 RAO 모델이 아닙니다. 이 결과는 실제 항해 데이터 결과와 따로 해석해야 합니다.")
+        st.write(f"Hs {', '.join(f'{h:g}' for h in VIRTUAL_HS)} m(WMO 3~6 대표값) × Tp {', '.join(f'{t:g}' for t in VIRTUAL_TP)} s의 16개 조건에서 "
+                 "가상 창을 만들고 조건마다 자동 튜닝을 실행합니다. 이어서 각 조건의 게인을 다른 조건에 적용한 regret으로 "
+                 "Hs와 Tp 중 어느 변수가 최적 게인에 더 큰 영향을 주는지 비교합니다.")
+        vopts=tuning_options("virt",expanded=True)
+        v1,v2,v3=st.columns(3)
+        v_trials=int(v1.slider("조건별 탐색 후보 수",16,48,20,4,key="virt_trials"))
+        v_train=int(v2.slider("조건별 학습창 수",2,6,3,1,key="virt_ntrain"))
+        v_dur=float(v3.select_slider("창 길이(s)",[60,120,180,240],value=120,key="virt_dur"))
+        st.caption("흔들림 크기는 기존 가상 모드 프리셋 배율(Hs 0.5/2/4 m → 0.6/2.0/3.5)을 Hs에 대해 보간한 값 × 사이드바 '흔들림 크기 배율'입니다. 파향 25°, 성분 5개.")
+        if st.button("가상 대조 실험 실행",key="run_virtual_bins"):
+            try:
+                bar=st.progress(0.0)
+                st.session_state["virtual_bins"]=run_virtual_analysis(current,fixed,vopts["objective"],vopts["case_fixed"],vopts["kd_log"],
+                                                                      v_trials,v_train,v_dur,gain,vopts["seed"],lambda f,m: bar.progress(min(f,1.0),text=m))
+            except Exception as exc:
+                st.error(f"가상 대조 실험 오류: {type(exc).__name__}: {exc}")
+        vr=st.session_state.get("virtual_bins")
+        if vr:
+            st.info(vr["summary"])
+            st.dataframe(vr["table"].round(4),hide_index=True,width="stretch")
+            tb=vr["table"]
+            for k in ("Kp","Kd","FF"):
+                piv=tb.pivot(index="Hs(m)",columns="Tp(s)",values=k)
+                st.plotly_chart(heatmap(piv.to_numpy(),[f"Tp {c:g}s" for c in piv.columns],[f"Hs {i:g}m" for i in piv.index],
+                                        f"가상 조건별 최적 {k}",k,text_fmt=".3f",colorscale="Blues"),width="stretch",key=f"virt_{k}")
+            st.markdown("**변수별 영향도** (최적 게인의 변화 폭, 탐색 범위 대비 %)")
+            st.dataframe(vr["influence"].round(2),hide_index=True,width="stretch")
+            labels=[f"Hs{h:g}/Tp{t:g}" for h,t in vr["conds"]]
+            st.plotly_chart(heatmap(100*vr["regret"],labels,labels,"가상 조건 전이 regret(%) (행 게인 → 열 조건)","regret(%)",zmin=0,text_fmt=".0f",colorscale="Reds"),width="stretch",key="virt_regret")
+            st.download_button("가상 대조 실험 CSV",tb.to_csv(index=False).encode("utf-8-sig"),file_name="virtual_sea_state_gains.csv",mime="text/csv",key="dl_virt")
+            st.caption("가상 파도는 실선 RAO 모델이 아님. 실제 항해 데이터의 해상상태별 결과와 섞어서 해석하지 마세요.")
 
 with st.expander("모델·데이터 출처와 해석상의 한계"):
     st.markdown("""
@@ -1197,12 +2329,15 @@ with st.expander("모델·데이터 출처와 해석상의 한계"):
 - 현재 구간이 끝나면 자동으로 다음 날짜/구간으로 넘어갑니다.
 - GitHub에는 대용량 원본 데이터를 올리지 않습니다.
 
-**자동 최적화**
-- FF, Kp, Kd, α만 조정합니다.
+**시뮬레이션 기반 자동 튜닝(무작위 탐색 + 국소 탐색)**
+- FF, Kp, Kd, α만 조정합니다. 실험 케이스로 FF=1 고정 또는 FF=0(PD만)도 선택할 수 있습니다.
 - τ, 최대 각속도, 기계적 회전한계, 가상 센서 노이즈/바이어스는 사용자가 정한 값으로 고정합니다.
-- 모든 일별 파일에서 날짜별·구간별 대표 4분 창을 여러 개 추출합니다. 학습 구간에서 후보를 탐색하고, 일부 날짜는 검증용으로 분리합니다.
-- 원자료는 1Hz이므로 자동 최적화는 1Hz 표본에서 수행합니다. 재생 화면만 50Hz 모델 입력을 위해 보간합니다.
-- 목적함수는 Roll/Pitch RMS와 95백분위 잔차를 줄이고, 서보 사용량과 포화율을 억제하도록 구성했습니다.
+- 일별 파일을 전체 기간에서 균등하게 골라 대표 4분 창을 추출합니다. 학습 구간에서 후보를 탐색하고, 일부 날짜는 검증용으로 분리합니다.
+- 자동 튜닝 평가는 실시간 재생과 같은 50Hz 제어 루프, 같은 선형 보간, 같은 노이즈 생성 순서를 씁니다(일치 검증 expander에서 확인 가능).
+- 탐색 단계는 학습창 일부(최대 30개)만 쓰고, 최종 검증은 검증창 전체 × 노이즈 시드 3개 이상의 평균을 씁니다.
+- 목적함수는 제약 조건 방식(자세 RMS비 최소화, 포화율 ≤1%·리밋사이클 없음 위반 시 페널티)과 가중합 방식 중 고를 수 있습니다.
+- 서보 부담 지표는 관절 각속도 RMS, 각가속도 RMS, 2Hz 이상 고주파 명령 비율입니다(관절각 자체는 수평 유지에 필요한 동작이라 벌점에서 뺐습니다).
+- 최종 추천값은 게인 ×1.5/×2, 서보 τ ×0.5/×1.5, 리밋사이클 검사를 통과한 후보 중에서 고릅니다.
 
 **중요한 과학적 한계**
 - 공개 INS는 ACE 기간 중 수집한 1Hz 항해 기록입니다. 제공기관은 원자료가 추가 보정되지 않았고 품질검사도 수행되지 않았다고 설명합니다.
@@ -1210,10 +2345,12 @@ with st.expander("모델·데이터 출처와 해석상의 한계"):
 - Hs/Tp는 선박 Heave 운동의 5분 구간 스펙트럼과 선박별 RAO를 이용해 재구성한 자료입니다. 독립 부표의 동시 직접 측정값이 아닙니다.
 - INS 자료에는 실제 제작할 캡스톤 플랫폼의 IMU 원시 자이로/가속도 신호가 들어 있지 않습니다. 센서 오차는 모델 가정값입니다.
 - 본 프로그램의 서보 모델은 1차 지연·속도 제한·각도 제한을 단순화해 표현합니다. 실제 DS51150의 응답, 부하, 기어 유격, 전원 강하, 구조 탄성은 실측으로 검증해야 합니다.
+- D항은 상판 자이로(관절 각속도 포함)를 그대로 쓰므로 Kd가 커지면 빠른 내부 루프가 생겨 진동합니다. Kd 탐색 상한은 이 안정 경계를 반영했습니다.
 - 따라서 자동 최적값은 **이 시뮬레이터 모델에 대한 후보값**입니다. 실물 적용 전에는 낮은 이득부터 단계적으로 시험하고, 독립된 실제 IMU·서보 시험 데이터로 재튜닝해야 합니다.
 
 **출처 및 라이선스**
 - Thomas & Pina Estany (2020), ACE INS, Zenodo DOI 10.5281/zenodo.3733228, CC BY 4.0.
 - Derkani et al. (2021), ACE reconstructed sea state, Zenodo DOI 10.5281/zenodo.4541564, CC BY 4.0.
+- 해상상태 분류: WMO Sea State Code(WMO 코드표 3700, Douglas 척도 기반) — 유의파고 Hs 기준 코드 0~9.
 - [ACE INS 전체 원자료](https://zenodo.org/records/3733228) · [Hs/Tp 재구성 자료](https://zenodo.org/records/4541564) · [AARI 선박 정보](https://www.aari.ru/eng)
 """)
