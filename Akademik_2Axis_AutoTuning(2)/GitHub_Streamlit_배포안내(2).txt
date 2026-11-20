@@ -1,0 +1,34 @@
+새 독립 프로젝트 (2) - GitHub / Streamlit 배포 안내
+================================================
+
+기존 저장소와 기존 Streamlit 앱은 건드리지 않습니다. 새 저장소와 새 앱을 만듭니다.
+
+1) GitHub에서 New repository를 선택합니다.
+   Repository name: Akademik-2Axis-AutoTuning-2
+   Visibility: Private 권장 (팀원 협업 시 Collaborators에 초대)
+   Add README: 선택하지 않아도 됩니다.
+
+2) 이 ZIP을 압축 해제한 뒤, 압축 해제 폴더 안의 파일을 새 저장소 최상위에 업로드합니다.
+   - app(2).py
+   - requirements.txt
+   - README(2).md
+   - .gitignore
+   - GitHub_Streamlit_배포안내(2).txt (선택)
+   폴더째로 중첩 업로드하지 마세요. 파일들이 저장소 첫 화면에 보여야 합니다.
+
+3) Commit changes를 누릅니다.
+
+4) Streamlit Community Cloud에서 Create app > Deploy a public app from GitHub를 선택합니다.
+   Repository: duhwanyun635-cloud/Akademik-2Axis-AutoTuning-2
+   Branch: main
+   Main file path: app(2).py
+   App URL: akademik-2axis-autotuning-2
+   그다음 Deploy를 누릅니다.
+
+5) 배포 후 앱에서 'Akademik 전체 항해 데이터' 모드를 고르고, 메인 화면의
+   '전체 항해 데이터 자동 다운로드 및 등록 시작' 버튼을 누릅니다.
+
+중요: requirements.txt 파일명은 Streamlit이 의존성 파일을 자동으로 인식하도록 그대로 유지합니다.
+메인 앱 소스는 app(2).py로 분리되어 있으므로 기존 app.py와 충돌하지 않습니다.
+
+기존 프로젝트를 수정하거나 삭제하거나 덮어쓰지 마세요. 이번 프로젝트는 새 저장소 및 새 Streamlit 앱으로 따로 관리합니다.
